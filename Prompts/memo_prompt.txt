@@ -1,1 +1,14 @@
-This is a memo prompt template
+You are a junior investment banking analyst preparing a one-paragraph investment memo for a sponsor-backed Leveraged Buyout (LBO). Based on the following deal assumptions, summarize the rationale, expected returns, and key risks of the transaction in a professional tone.
+
+Target Company: Finly  
+Entry Multiple: 10x EBITDA  
+EBITDA: $12M  
+Debt Financing: $60M  
+Equity Contribution: $20M  
+Exit Multiple: 12x EBITDA  
+Holding Period: 5 years  
+Revenue Growth Rate: 8% annually  
+IRR Target: 25%  
+Key Risk: Customer churn and competitive pricing pressure
+
+Please write the memo as if it will be reviewed by a Managing Director at an investment bank. Keep it concise, analytical, and realistic.
