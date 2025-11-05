@@ -23,4 +23,4 @@ BankSmart is a smart assistant for investment banking analysts. It helps users r
 - Automate repetitive investment banking tasks
 - Simulate real analyst workflows for training and education
 
-Created and maintained by Ayu ✨
+Created and maintained by Sneha ✨
