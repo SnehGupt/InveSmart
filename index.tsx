@@ -267,9 +267,12 @@ let postRenderCallbacks = [];
 
 
 // --- 3. GEMINI API SERVICE ---
-const API_KEY = process.env.API_KEY || "";
-let ai;
-if(API_KEY) ai = new GoogleGenAI({ apiKey: API_KEY });
+const API_KEY = import.meta.env.VITE_API_KEY || "";
+let ai: GoogleGenAI | null = null;
+
+if (API_KEY) {
+  ai = new GoogleGenAI({ apiKey: API_KEY });
+}
 const model = 'gemini-2.5-flash';
 
 async function generateAnalysis(ticker, companyName, type) {
