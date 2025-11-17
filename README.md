@@ -1,26 +1,20 @@
-# BankSmart 🧠💼
+<div align="center">
+<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+</div>
 
-BankSmart is a smart assistant for investment banking analysts. It helps users run Leveraged Buyout (LBO) models, generate memos, SWOT analyses, and pitch decks using Gemini AI.
+# Run and deploy your AI Studio app
 
-## 🔧 What’s Inside
+This contains everything you need to run your app locally.
 
-- `LBO_Model/` → Spreadsheet files for deal modeling (IRR, MOIC, exit value)
-- `Prompts/` → Gemini prompt templates for memos, SWOTs, and pitch decks
-- `Outputs/` → AI-generated results based on deal inputs
-- `Docs/` → Planning notes, coordinator feedback, and project summaries
+View your app in AI Studio: https://ai.studio/apps/drive/1odyXg76o0SmHY2K_YgPawXlxRU0CdBjP
 
-## 🧠 How It Works
+## Run Locally
 
-1. Fill in the LBO spreadsheet with deal assumptions
-2. Copy the numbers into Gemini prompts
-3. Run the prompts in Google AI Studio
-4. Save the outputs in organized folders
-5. Share results with your team or mentors
+**Prerequisites:**  Node.js
 
-## 🚀 Goals
 
-- Help interns and analysts learn faster
-- Automate repetitive investment banking tasks
-- Simulate real analyst workflows for training and education
-
-Created and maintained by Sneha ✨
+1. Install dependencies:
+   `npm install`
+2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
+3. Run the app:
+   `npm run dev`

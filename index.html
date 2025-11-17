@@ -1,40 +1,445 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>BankSmart</title>
+    <title>Pitchly</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.plot.ly/plotly-2.32.0.min.js" charset="utf-8"></script>
+    <script type="importmap">
+      {
+        "imports": {
+          "@google/genai": "https://aistudiocdn.com/@google/genai@^1.29.0"
+        }
+      }
+    </script>
     <style>
-      /* For custom scrollbar styling */
-      .custom-scrollbar::-webkit-scrollbar {
-        width: 8px;
-        height: 8px;
+      :root {
+        --bg-primary: #f6f8fa;
+        --bg-secondary: #ffffff;
+        --panel-bg-color: rgba(255, 255, 255, 0.7);
+        --border-primary: #d0d7de;
+        --text-primary: #000000;
+        --text-secondary: #000000;
+        --text-tertiary: #000000;
+        --text-highlight: #bf8700;
+        --accent-blue: #0969da;
+        --accent-green: #1f883d;
+        --accent-red: #d1242f;
+        --accent-cyan: #0550ae;
+        --accent-gold: #bf8700;
+        --input-bg: #f6f8fa;
+        --button-bg: #f6f8fa;
+        --button-hover-bg: #f3f4f6;
+        --slider-track-bg: #d0d7de;
+        --slider-thumb-bg: #bf8700;
+        --welcome-input-bg: #f6f8fa;
+        --welcome-input-border: #d0d7de;
       }
-      .custom-scrollbar::-webkit-scrollbar-track {
-        background: #1e293b; /* slate-800 */
+      .dark-mode {
+        --bg-primary: #0d1117;
+        --bg-secondary: #161b22;
+        --panel-bg-color: rgba(22, 27, 34, 0.8);
+        --border-primary: #30363d;
+        --text-primary: #c9d1d9;
+        --text-secondary: #8b949e;
+        --text-tertiary: #475569;
+        --text-highlight: #e3b341;
+        --accent-blue: #388bfd;
+        --accent-green: #2da44e;
+        --accent-red: #f85149;
+        --accent-cyan: #00FFFF;
+        --accent-gold: #e3b341;
+        --input-bg: #0d1117;
+        --button-bg: #21262d;
+        --button-hover-bg: #30363d;
+        --slider-track-bg: #30363d;
+        --slider-thumb-bg: #e3b341;
+        --welcome-input-bg: #010409;
+        --welcome-input-border: #30363d;
       }
-      .custom-scrollbar::-webkit-scrollbar-thumb {
-        background: #475569; /* slate-600 */
-        border-radius: 4px;
+      body {
+        font-family: 'Inter', sans-serif;
+        background-color: var(--bg-primary);
+        color: var(--text-primary);
+        overflow-x: hidden;
+        transition: background-color 0.3s ease, color 0.3s ease;
       }
-      .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-        background: #64748b; /* slate-500 */
+      .font-mono { font-family: 'Roboto Mono', monospace; }
+      ::-webkit-scrollbar { width: 8px; height: 8px; }
+      ::-webkit-scrollbar-track { background: var(--bg-secondary); }
+      ::-webkit-scrollbar-thumb { background: var(--text-tertiary); border-radius: 4px; }
+      ::-webkit-scrollbar-thumb:hover { background: #64748b; }
+      .glass-panel {
+        background-color: var(--panel-bg-color);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        border: 1px solid var(--border-primary);
+        transition: background-color 0.3s ease, border-color 0.3s ease;
       }
+      #welcome-page h1, #welcome-page p {
+          text-shadow: 0 2px 10px rgba(0,0,0,0.5);
+      }
+      #welcome-page input {
+          background-color: var(--welcome-input-bg);
+          border-color: var(--welcome-input-border);
+          color: var(--text-primary);
+      }
+      #header-container input, #header-container button {
+          color: var(--text-primary)
+      }
+      #header-container input {
+          background-color: rgba(13, 17, 23, 0.5);
+          border-color: var(--border-primary);
+      }
+       #header-container button.bg-gray-700 {
+          background-color: var(--button-bg);
+          border: 1px solid var(--border-primary);
+       }
+       #header-container button.bg-gray-700:hover {
+          background-color: var(--button-hover-bg);
+       }
+       .nav-btn.bg-gray-700\/50 {
+            background-color: var(--button-bg);
+            border: 1px solid var(--border-primary);
+       }
+        .nav-btn.bg-gray-700\/50:hover {
+            background-color: var(--button-hover-bg);
+        }
+
+      .prose-custom h1, .prose-custom h2, .prose-custom h3 { margin-top: 1.5em; margin-bottom: 0.5em; font-weight: 600; color: var(--text-primary); }
+      .prose-custom h1 { font-size: 1.5rem; }
+      .prose-custom h2 { font-size: 1.25rem; }
+      .prose-custom h3 { font-size: 1.1rem; }
+      .prose-custom strong { font-weight: 600; color: var(--accent-gold); }
+      .prose-custom p, .prose-custom ul { margin-bottom: 1em; }
+      
+      .hidden { display: none !important; }
+      @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+      @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+      .fade-in { animation: fadeIn 0.5s ease-out forwards; }
+      
+      @keyframes flashTextGreen {
+        0%, 50% { color: var(--accent-green); }
+        100% { color: var(--text-primary); }
+      }
+      @keyframes flashTextRed {
+        0%, 50% { color: var(--accent-red); }
+        100% { color: var(--text-primary); }
+      }
+      .flash-text-green { animation: flashTextGreen 0.6s ease-out; }
+      .flash-text-red { animation: flashTextRed 0.6s ease-out; }
+      
+      /* Welcome Page Animations */
+      @keyframes typing {
+        from { width: 0; }
+        to { width: 100%; }
+      }
+      @keyframes blink-caret {
+        from, to { border-color: transparent; }
+        50% { border-color: var(--accent-gold); }
+      }
+      .typing-effect h1 {
+        display: inline-block;
+        overflow: hidden;
+        white-space: nowrap;
+        border-right: .15em solid var(--accent-gold);
+        animation:
+          typing 2s steps(9, end),
+          blink-caret .75s step-end infinite;
+        animation-fill-mode: forwards;
+        width: 0;
+        letter-spacing: .05em;
+      }
+      
+      @keyframes pulse-glow {
+        0%, 100% {
+          box-shadow: 0 0 5px var(--accent-gold), 0 0 10px var(--accent-gold);
+          transform: scale(1);
+        }
+        50% {
+          box-shadow: 0 0 10px var(--accent-gold), 0 0 20px var(--accent-gold);
+          transform: scale(1.02);
+        }
+      }
+      .animated-launch-btn {
+        animation: pulse-glow 2.5s infinite ease-in-out;
+        transition: transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out;
+      }
+      .animated-launch-btn:hover {
+        animation-play-state: paused;
+        transform: scale(1.05);
+        box-shadow: 0 0 15px var(--accent-gold), 0 0 30px var(--accent-gold);
+      }
+
+
+      /* Autocomplete styles */
+      .autocomplete { position: relative; }
+      .autocomplete-items {
+        position: absolute;
+        border: 1px solid var(--border-primary);
+        background-color: var(--bg-secondary);
+        z-index: 99;
+        top: calc(100% + 4px);
+        left: 0;
+        right: 0;
+        max-height: 250px;
+        overflow-y: auto;
+        border-radius: 0.5rem;
+        box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+      }
+      .autocomplete-item {
+        padding: 0.75rem 1rem;
+        cursor: pointer;
+        color: var(--text-secondary);
+        border-bottom: 1px solid var(--border-primary);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      .autocomplete-item:last-child { border-bottom: none; }
+      .autocomplete-item:hover { background-color: var(--border-primary); color: var(--text-primary); }
+      .autocomplete-item .ticker { font-family: 'Roboto Mono', monospace; font-weight: 700; color: var(--text-primary); }
+      .autocomplete-item .name { font-size: 0.875rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .autocomplete-item strong { color: var(--accent-gold); font-weight: 600; }
+      
+      /* Enhanced Peer Table Styles */
+      .peer-table .sortable-header { cursor: pointer; user-select: none; }
+      .peer-table .sortable-header:hover { color: var(--text-primary); }
+      .peer-table .sortable-header.asc, 
+      .peer-table .sortable-header.desc { 
+        color: var(--accent-gold); 
+      }
+      .peer-table thead th { font-weight: 600; background-color: var(--bg-secondary); }
+      .peer-table tbody tr { border-bottom: 1px solid var(--border-primary); transition: background-color 0.2s; }
+      .peer-table tbody tr:last-child { border-bottom: none; }
+      .peer-table tbody tr:hover { background-color: var(--border-primary); }
+      .peer-table .highlight-row { background-color: rgba(227, 179, 65, 0.1) !important; box-shadow: inset 3px 0 0 0 var(--accent-gold); }
+      
+      .mini-bar-container { width: 100%; background-color: var(--border-primary); border-radius: 2px; height: 6px; margin-top: 4px; overflow: hidden; }
+      .mini-bar { height: 100%; border-radius: 2px; transition: width 0.3s ease-in-out; }
+      .mini-bar.positive { background-color: var(--accent-cyan); }
+      .mini-bar.negative { background-color: var(--accent-red); }
+
+      /* Sentiment Tag Styles */
+      .sentiment-tag { font-size: 0.75rem; padding: 0.25rem 0.6rem; border-radius: 9999px; font-weight: 600; display: inline-flex; align-items: center; gap: 0.3rem; border: 1px solid transparent; line-height: 1; }
+      .sentiment-bullish { background-color: rgba(45, 164, 78, 0.2); color: #3fb950; border-color: rgba(45, 164, 78, 0.4); }
+      .sentiment-bearish { background-color: rgba(248, 81, 73, 0.15); color: #f85149; border-color: rgba(248, 81, 73, 0.3); }
+      .sentiment-neutral { background-color: rgba(227, 179, 65, 0.15); color: #e3b341; border-color: rgba(227, 179, 65, 0.3); }
+      
+       /* Custom Slider Styles */
+      input[type="range"].model-slider { -webkit-appearance: none; appearance: none; width: 100%; height: 6px; background: var(--slider-track-bg); border-radius: 3px; outline: none; opacity: 0.8; transition: opacity .2s; }
+      input[type="range"].model-slider:hover { opacity: 1; }
+      input[type="range"].model-slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; background: var(--slider-thumb-bg); cursor: pointer; border-radius: 50%; border: 2px solid var(--bg-secondary); }
+      input[type="range"].model-slider::-moz-range-thumb { width: 16px; height: 16px; background: var(--slider-thumb-bg); cursor: pointer; border-radius: 50%; border: 2px solid var(--bg-secondary); }
+
+      /* Professional Pitch Deck Styles */
+      .pitch-deck-container {
+        background-color: var(--bg-secondary);
+        border: 1px solid var(--border-primary);
+        border-radius: 0.75rem;
+        box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.2), 0 8px 10px -6px rgba(0, 0, 0, 0.2);
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        min-height: 70vh;
+      }
+      .pitch-deck-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 1rem 1.5rem;
+        background-color: var(--bg-primary);
+        border-bottom: 1px solid var(--border-primary);
+      }
+      .pitch-deck-header .company-info {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+      }
+      .pitch-deck-header .slide-counter {
+        font-family: 'Roboto Mono', monospace;
+        font-size: 0.875rem;
+        color: var(--text-secondary);
+      }
+      .pitch-deck-slide {
+        padding: 2rem 2.5rem;
+        flex-grow: 1;
+      }
+      .pitch-deck-slide .slide-title {
+        font-size: 1.75rem;
+        font-weight: 700;
+        color: var(--text-primary);
+        margin-bottom: 1.5rem;
+        padding-bottom: 0.75rem;
+        border-bottom: 2px solid var(--accent-gold);
+      }
+      .pitch-deck-slide .slide-body {
+          display: flex;
+          flex-direction: column;
+          gap: 1.5rem;
+      }
+      .pitch-deck-footer {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 1rem 1.5rem;
+        border-top: 1px solid var(--border-primary);
+        background-color: var(--bg-primary);
+      }
+      .confidential-note {
+        font-size: 0.75rem;
+        color: var(--text-secondary);
+        font-style: italic;
+      }
+      .slide-nav-btn {
+        background-color: var(--button-bg);
+        border: 1px solid var(--border-primary);
+        color: var(--text-primary);
+        padding: 0.5rem 1.5rem;
+        border-radius: 0.375rem;
+        font-weight: 600;
+        transition: background-color 0.2s;
+      }
+      .slide-nav-btn:hover:not(:disabled) { background-color: var(--button-hover-bg); }
+      .slide-nav-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+      
+      /* Enhanced Prose Styles for Slides */
+      .prose-custom ul {
+        list-style: none;
+        padding-left: 0;
+      }
+      .prose-custom ul li {
+        padding-left: 1.5em;
+        text-indent: -1.5em;
+        margin-bottom: 0.75em;
+        line-height: 1.6;
+      }
+      .prose-custom ul li::before {
+        content: '■';
+        color: var(--accent-gold);
+        margin-right: 0.75em;
+        font-size: 0.8em;
+        display: inline-block;
+      }
+      .prose-custom table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.875rem;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+        border-radius: 0.5rem;
+        overflow: hidden;
+        border: 1px solid var(--border-primary);
+      }
+      .prose-custom th, .prose-custom td {
+        padding: 0.75rem 1rem;
+        text-align: left;
+        border-bottom: 1px solid var(--border-primary);
+      }
+      .prose-custom th {
+        background-color: var(--bg-primary);
+        font-weight: 600;
+        color: var(--text-secondary);
+        text-transform: uppercase;
+        font-size: 0.75rem;
+        letter-spacing: 0.05em;
+      }
+      .prose-custom tbody tr:last-child td { border-bottom: none; }
+      .prose-custom tbody tr:nth-child(even) { background-color: var(--bg-primary); }
+      .prose-custom tbody tr:hover { background-color: rgba(227, 179, 65, 0.1); }
+
+      /* Chart & Diagram Styles */
+      .chart-container {
+          width: 100%;
+          min-height: 400px;
+          margin: 1.5rem 0;
+      }
+      .diagram-container {
+          position: relative;
+          padding: 1rem 0;
+          margin: 1.5rem 0;
+      }
+      .diagram-timeline::before, .diagram-flow::before, .diagram-roadmap::before {
+          content: '';
+          position: absolute;
+          left: 11px;
+          top: 0;
+          bottom: 0;
+          width: 4px;
+          background-color: var(--border-primary);
+          border-radius: 2px;
+      }
+      .diagram-item {
+          position: relative;
+          padding-left: 40px;
+          margin-bottom: 2rem;
+      }
+      .diagram-item:last-child {
+          margin-bottom: 0;
+      }
+      .diagram-item-connector {
+          position: absolute;
+          left: 4px;
+          top: 5px;
+          width: 16px;
+          height: 16px;
+          background-color: var(--accent-gold);
+          border: 3px solid var(--bg-secondary);
+          border-radius: 50%;
+          z-index: 1;
+      }
+      .diagram-item-content {
+          background-color: var(--bg-primary);
+          padding: 1rem;
+          border-radius: 0.5rem;
+          border: 1px solid var(--border-primary);
+          position: relative;
+      }
+       .diagram-item-content strong {
+          color: var(--accent-gold);
+          display: block;
+          margin-bottom: 0.25rem;
+      }
+
+
+      /* Model input select */
+      .model-select { background-color: var(--bg-secondary); border: 1px solid var(--border-primary); color: var(--text-primary); font-weight: 500; }
+      .model-select:focus { outline: none; border-color: var(--accent-gold); box-shadow: 0 0 0 2px rgba(227, 179, 65, 0.3); }
+      
+      .text-gray-300 { color: var(--text-primary); }
+      .text-gray-400 { color: var(--text-secondary); }
+      .text-gray-500 { color: var(--text-secondary); }
+      .bg-gray-900 { background-color: var(--bg-primary); }
+      .border-gray-600 { border-color: var(--border-primary); }
+      .text-amber-400 { color: var(--accent-gold); }
+      .text-yellow-400 { color: var(--accent-gold); }
+      .border-gray-700\/50 { border-color: rgba(55, 65, 81, 0.5); }
+      .border-b.border-gray-700 { border-bottom-color: var(--border-primary); }
+      .border-t.border-gray-700 { border-top-color: var(--border-primary); }
+      .text-green-400 { color: var(--accent-green); }
+      .text-red-400 { color: var(--accent-red); }
+      .text-red-500 { color: var(--accent-red); }
+      .text-blue-400 { color: var(--accent-blue); }
+      .text-cyan-400 { color: var(--accent-cyan); }
+
     </style>
-<script type="importmap">
-{
-  "imports": {
-    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.28.0",
-    "react/": "https://aistudiocdn.com/react@^19.2.0/",
-    "react": "https://aistudiocdn.com/react@^19.2.0",
-    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/"
-  }
-}
-</script>
 </head>
-<body class="bg-slate-900 text-gray-200 antialiased">
-    <div id="root"></div>
-    <script type="module" src="/index.tsx"></script>
+<body class="antialiased">
+    
+    <div id="welcome-page" class="w-screen h-screen flex flex-col items-center justify-center p-4">
+        <!-- Welcome page content will be rendered here -->
+    </div>
+
+    <div id="dashboard-page" class="p-4 md:p-6 lg:p-8 max-w-[1800px] mx-auto hidden">
+        <header id="header-container" class="sticky top-4 z-20"></header>
+        <nav id="navigation-container" class="mt-6 z-10"></nav>
+        <main id="content-container" class="mt-6"></main>
+    </div>
+
+    <script type="module" src="./index.tsx"></script>
 </body>
 </html>
