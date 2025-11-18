@@ -1,5 +1,5 @@
 {
-  "name": "Copy of BankSmart",
+  "name": "Pitchly",
   "description": "An application to automate the workflow of a junior investment banker for company valuation and pitch deck generation, inspired by OpenAI's Project Mercury and powered by Gemini 2.5 Pro.",
   "requestFramePermissions": []
 }

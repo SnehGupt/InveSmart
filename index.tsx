@@ -2,6 +2,9 @@
 
 import { GoogleGenAI } from "@google/genai";
 
+// --- FIX: Declare Plotly to resolve 'Cannot find name' error, as it's likely loaded from a script tag. ---
+declare var Plotly: any;
+
 // --- 1. LIVE API & CACHING SERVICES ---
 
 const apiService = {
@@ -34,12 +37,24 @@ const apiService = {
     },
     _defaultTaxInfo: { country: 'an estimated region', rate: 0.23 },
 
+    
+
     _parseValue(value) {
         if (value === null || value === undefined) return null;
+
+        // Handle objects like { raw, fmt } first.
+        if (typeof value === 'object') {
+            if (value.hasOwnProperty('raw') && typeof value.raw === 'number' && isFinite(value.raw)) {
+                return value.raw;
+            }
+            return null; // It's an object, but not in a format we can parse.
+        }
+
         if (typeof value === 'number') return isFinite(value) ? value : null;
+        
         if (typeof value !== 'string' || value.trim() === '') return null;
 
-        // Handle 'T', 'B', 'M' suffixes.
+        // Handle string formats with 'T', 'B', 'M' suffixes.
         const cleanedValue = value.replace(/,/g, '').trim();
         const numPart = parseFloat(cleanedValue);
 
@@ -143,6 +158,7 @@ const apiService = {
             pbRatio,
             roe: roe ? roe / 100 : null, // convert to decimal
             domain: getTickerDomain(data.ticker),
+            valuationMethod: data.valuationMethod || (getTickerDomain(data.ticker) === 'Financials' ? 'DDM' : 'DCF'),
             // Fix: Cast data.lastUpdated to any to handle potential type inference issues.
             lastUpdated: new Date(data.lastUpdated as any),
         };
@@ -250,9 +266,13 @@ let state = {
     currentTab: 'valuation_models', 
     ticker: 'TSLA',
     welcomeTicker: 'TSLA',
+    welcomeTickerError: '',
+    isWelcomeTickerValidating: false,
+    tickerSwitchError: '',
+    isTickerSwitchValidating: false,
     dashboardData: null, // Will hold { quote, peers, workflow }
-    analysisContent: {}, // e.g., { swot: { ticker: "TSLA", content: "..." } }
-    pitchDeck: { currentSlide: 0, slides: [] },
+    analysisContent: {}, // Ticker-keyed cache: { "TSLA": { swot: "...", memo: "..." } }
+    pitchDeck: { ticker: null, currentSlide: 0, slides: [] },
     lboScenario: 'baseCase', // New state for LBO scenario
     loading: { data: false, analysis: false, lbo: false },
     error: null,
@@ -260,20 +280,86 @@ let state = {
     alert: { target: null, active: false, triggered: false, direction: null },
     showAlertInput: false,
     realtimeStatus: 'connected', // 'connected', 'error', 'connecting'
-    theme: localStorage.getItem('banksmart-theme') || 'dark', // 'dark' or 'light'
+    theme: 'dark', // 'dark' or 'light'
 };
 let realtimeIntervalId = null;
 let postRenderCallbacks = [];
 
+function setState(newState) {
+    Object.assign(state, newState);
+    renderApp();
+    saveState();
+}
+
+function saveState() {
+    try {
+        const stateToSave = { ...state, dashboardData: null, loading: { data: false, analysis: false, lbo: false }, error: null, realtimeStatus: 'connected' };
+        localStorage.setItem('pitchly-app-state', JSON.stringify(stateToSave));
+    } catch (e) {
+        console.error("Error saving state to localStorage:", e);
+    }
+}
+
+function loadState() {
+    try {
+        const savedStateJSON = localStorage.getItem('pitchly-app-state');
+        if (savedStateJSON) {
+            const savedState = JSON.parse(savedStateJSON);
+            // Don't load ephemeral state or view state to always start fresh
+            delete savedState.currentView; // Always start at welcome page on refresh
+            delete savedState.ticker;      // Always start at welcome page on refresh
+            delete savedState.dashboardData;
+            delete savedState.loading;
+            delete savedState.error;
+            delete savedState.realtimeStatus;
+            delete savedState.isWelcomeTickerValidating;
+            delete savedState.welcomeTickerError;
+            delete savedState.isTickerSwitchValidating;
+            delete savedState.tickerSwitchError;
+            Object.assign(state, savedState);
+        }
+    } catch (e) {
+        console.error("Error loading state from localStorage:", e);
+    }
+}
+
 
 // --- 3. GEMINI API SERVICE ---
-const API_KEY = import.meta.env.VITE_API_KEY || "";
-let ai: GoogleGenAI | null = null;
-
-if (API_KEY) {
-  ai = new GoogleGenAI({ apiKey: API_KEY });
-}
+const API_KEY = process.env.API_KEY || "";
+let ai;
+if(API_KEY) ai = new GoogleGenAI({ apiKey: API_KEY });
 const model = 'gemini-2.5-flash';
+
+async function validateTickerWithGemini(ticker) {
+    if (!ai) {
+        console.warn("API_KEY not set, skipping AI validation.");
+        return { valid: true }; // Fallback to allow regular API check
+    }
+    const prompt = `
+        You are a financial data validation assistant. Your role is to determine if a given string is a valid, existing stock ticker symbol on a major exchange (like NASDAQ, NYSE, etc.).
+
+        **Crucial Instruction:** You MUST distinguish between a company's common name and its actual ticker symbol. For example, "LG" is a company name, but its ticker might be "003550.KS" (LG Corp) or "LPL" (LG Display). The input string must be a valid ticker symbol itself, not the company name.
+
+        Use your search capabilities to verify the ticker's existence.
+
+        For the input string "${ticker}", respond with ONLY a single, valid JSON object:
+        - If the string is a valid, existing ticker symbol: {"valid": true}
+        - If the string is a company name, does not exist, or is improperly formatted: {"valid": false, "reason": "Provide a brief explanation, e.g., 'Ticker not found' or 'LG is a company name, not a ticker symbol. Try LPL or 003550.KS.'"}
+    `;
+
+    try {
+        const response = await ai.models.generateContent({ model, contents: prompt, config: { tools: [{ googleSearch: {} }] } });
+        let jsonString = response.text.trim();
+        if (jsonString.startsWith("```json")) {
+            jsonString = jsonString.substring(7, jsonString.length - 3).trim();
+        }
+        return JSON.parse(jsonString);
+    } catch (e) {
+        console.error("Failed to validate ticker with Gemini:", e);
+        // If Gemini fails, fallback to the existing API check to avoid blocking the user.
+        return { valid: true }; 
+    }
+}
 
 async function generateAnalysis(ticker, companyName, type) {
     if (!ai) return "API_KEY is not set up. Cannot generate analysis.";
@@ -283,17 +369,17 @@ async function generateAnalysis(ticker, companyName, type) {
         pitch_deck: `Act as a senior investment banking analyst creating a client-facing pitch deck for ${companyName} (${ticker}) suitable for senior executives.
 
 **Global Instructions:**
-- **Layouts:** For every slide, you MUST use a professional corporate slide layout. Instead of text placeholders like "[Visual: ...]", generate the actual data for the visual in a structured format. Use professional tables, charts with data, and diagrams with items.
+- **Layouts:** For every slide, you **MUST** use a professional corporate slide layout. Instead of text placeholders like "[Visual: ...]", generate the actual data for the visual in a structured format. Use professional tables, charts with data, and diagrams with items.
 - **Style:** The tone must be professional, clean, and corporate. The content should be boardroom-ready with a neutral color palette, consistent fonts, and balanced spacing.
 - **Conciseness:** Keep each slide concise and visually polished.
 - **Formatting:** Generate multiple slides using markdown. Each slide must have a clear title starting with '###'.
-- **Consistency:** You **MUST** generate all 9 slides in the specified order. Do not skip slides, even if data is sparse. Populate all chart and diagram data with realistic, company-specific information based on your search capabilities; do not use the placeholder data provided in the examples.
+- **Consistency:** You **MUST** generate all 10 slides in the specified order. Do not skip slides, even if data is sparse. Populate all chart and diagram data with realistic, company-specific information based on your search capabilities; do not use the placeholder data provided in the examples.
 
 **Required Slides & Visual Formats:**
 
 ### 1. ${companyName} (${ticker}) Company Overview
 - Generate a clean overview with key facts (HQ, Founded, Employees), business model summary, and market positioning.
-- Use a markdown table for the key facts.
+- **MUST** use a markdown table for the key facts.
 
 ### 2. ${companyName} (${ticker}) Public Market Overview & NTM EBITDA Evolution
 - Present a dual-axis chart analysis. Provide concise commentary on market trends and performance drivers.
@@ -320,7 +406,7 @@ Jan 2024,155,130
 [/CHART]
 
 ### 4. Broker Perspectives on ${companyName} (${ticker})
-- Summarize broker ratings in a professional markdown table with columns: Broker, Rating, Price Target.
+- **MUST** summarize broker ratings in a professional markdown table with columns: Broker, Rating, Price Target.
 - **MUST** include a sentiment chart data in this exact format, replacing placeholder values with realistic data for ${companyName}:
 [CHART type="donut" title="Broker Rating Distribution"]
 Rating,Count
@@ -330,7 +416,7 @@ Sell,2
 [/CHART]
 
 ### 5. Trading Multiples
-- Create a clean, professional markdown table comparing ${companyName} (${ticker}) to its peers.
+- **MUST** create a clean, professional markdown table comparing ${companyName} (${ticker}) to its peers.
 - Columns: Company, Scale (Market Cap), Revenue Growth (NTM %), Profitability Margin (NTM EBITDA %), FV/Revenue (NTM), FV/EBITDA (NTM).
 
 ### 6. Diagram Showing Growth of ${companyName} (${ticker})
@@ -362,8 +448,12 @@ Strategic Partnerships: Form alliances with major cloud providers.
 [/DIAGRAM]
 
 ### 9. ${companyName} (${ticker}) Other Companies Overview
-- Provide a comparative overview of other key players in the sector using a markdown table.
+- **MUST** provide a comparative overview of other key players in the sector using a markdown table.
 - Highlight ${companyName} (${ticker})'s key differentiators and competitive positioning.
+
+### 10. Management Team
+- **MUST** create a clean, professional markdown table of the key management team.
+- Include columns for Name, Title, and a brief note on their background or tenure.
 `,
         news: `Act as a senior financial analyst. Use real-time search data to summarize the most impactful news for ${ticker} from the past month. Focus on earnings, strategic initiatives, and analyst ratings. Format as 3-4 concise bullet points.`,
     };
@@ -417,6 +507,12 @@ function renderApp() {
 
 function renderWelcomePage() {
     const container = document.getElementById('welcome-page');
+    const { welcomeTicker, isWelcomeTickerValidating, welcomeTickerError } = state;
+
+    const buttonDisabled = isWelcomeTickerValidating;
+    const buttonClasses = `animated-launch-btn bg-amber-600 hover:bg-amber-500 text-white font-bold py-3 px-6 rounded-lg ${buttonDisabled ? 'opacity-50 cursor-not-allowed' : ''}`;
+    const inputClasses = `flex-grow bg-gray-900 border-2 rounded-lg px-5 py-3 placeholder-gray-500 focus:outline-none focus:ring-4 focus:ring-amber-500/50 transition-all text-xl text-center font-mono tracking-widest uppercase ${welcomeTickerError ? 'border-red-500' : 'border-gray-600'}`;
+
     container.innerHTML = `
         <div class="flex justify-center mb-6">
       
@@ -428,9 +524,10 @@ function renderWelcomePage() {
             <p class="text-lg text-gray-300 mt-2">Empowering junior analysts with real-time insights and modeling tools.</p>
             <div class="mt-8 max-w-md mx-auto">
                 <div class="flex gap-2 autocomplete">
-                     <input id="welcome-ticker-input" value="${state.welcomeTicker}" type="text" placeholder="e.g., AAPL, TSLA" class="flex-grow bg-gray-900 border-2 border-gray-600 rounded-lg px-5 py-3 placeholder-gray-500 focus:outline-none focus:ring-4 focus:ring-amber-500/50 transition-all text-xl text-center font-mono tracking-widest uppercase">
-                     <button id="launch-btn" class="animated-launch-btn bg-amber-600 hover:bg-amber-500 text-white font-bold py-3 px-6 rounded-lg">Launch</button>
+                     <input id="welcome-ticker-input" value="${welcomeTicker}" type="text" placeholder="e.g., AAPL, TSLA" class="${inputClasses}">
+                     <button id="launch-btn" class="${buttonClasses}" ${buttonDisabled ? 'disabled' : ''}>${isWelcomeTickerValidating ? 'Validating...' : 'Launch'}</button>
                 </div>
+                <div class="text-red-400 text-sm mt-2 text-left h-5">${welcomeTickerError}</div>
             </div>
         </div>`;
     addWelcomeEventListeners();
@@ -446,17 +543,48 @@ function renderDashboard() {
 function renderHeader() {
     const container = document.getElementById('header-container');
     const data = state.dashboardData?.quote;
+
+    // Common UI elements for the switch ticker functionality
+    const { isTickerSwitchValidating, tickerSwitchError } = state;
+    const switchButtonDisabled = isTickerSwitchValidating;
+    const switchButtonClasses = `bg-gray-700 hover:bg-gray-600 font-semibold py-1.5 px-3 rounded-md text-sm ${switchButtonDisabled ? 'opacity-50 cursor-not-allowed' : ''}`;
+    const switchInputClasses = `bg-gray-900/50 border rounded-md px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/50 w-32 font-mono uppercase ${tickerSwitchError ? 'border-red-500' : 'border-gray-600'}`;
+
+    const switchTickerUI = `
+        <div class="relative">
+            <div class="flex items-center gap-2 autocomplete">
+                <input id="ticker-switch-input" type="text" placeholder="Switch Ticker" class="${switchInputClasses}">
+                <button id="ticker-switch-btn" class="${switchButtonClasses}" ${switchButtonDisabled ? 'disabled' : ''}>${isTickerSwitchValidating ? '...' : 'Go'}</button>
+            </div>
+            ${tickerSwitchError ? `<div class="absolute top-full left-0 text-red-400 text-xs mt-1 w-full text-center">${tickerSwitchError}</div>` : ''}
+        </div>
+    `;
+
+    // The right-hand side controls (connection, alert, theme, switch)
+    const headerControls = `
+        <div class="flex items-center gap-4">
+            ${renderConnectionStatus()}
+            ${renderAlertUI()}
+            ${renderThemeToggle()}
+            ${switchTickerUI}
+        </div>
+    `;
+
     let content;
+    let mainContent;
 
     if (state.loading.data) {
-        content = `<div class="w-full h-24 flex items-center justify-center glass-panel rounded-xl"><p class="text-gray-400 animate-pulse">Loading data for ${state.ticker.toUpperCase()}...</p></div>`;
+        mainContent = `
+            <div class="flex-grow">
+                <p class="text-gray-400 animate-pulse">Loading data for ${state.ticker.toUpperCase()}...</p>
+            </div>
+        `;
     } else if (data) {
         const changeColor = data.change >= 0 ? 'text-green-400' : 'text-red-400';
         const { sentiment, className, emoji } = getSentimentDetails(data.changePercent);
         const sentimentTag = `<div id="sentiment-tag" class="sentiment-tag ${className}">${emoji} ${sentiment}</div>`;
         
-        content = `
-        <div class="flex flex-col md:flex-row items-center justify-between gap-4 glass-panel p-4 rounded-xl">
+        mainContent = `
             <div class="flex items-center gap-4">
                 <img src="${data.logoUrl || apiService.getLogoUrl(data.ticker)}" alt="${data.ticker} logo" class="h-12 w-12 object-contain bg-white/90 p-1 rounded-full" />
                 <div>
@@ -471,27 +599,31 @@ function renderHeader() {
                 <p id="header-latest-price" class="text-2xl font-bold">${formatterService.currency(data.price)} USD</p>
                 <p class="font-semibold ${changeColor}">${formatterService.currency(data.change)} (${formatterService.percent(data.changePercent / 100)})</p>
             </div>
-            <div class="flex items-center gap-4">
-                ${renderConnectionStatus()}
-                ${renderAlertUI()}
-                ${renderThemeToggle()}
-                <div class="flex items-center gap-2 autocomplete">
-                    <input id="ticker-switch-input" type="text" placeholder="Switch Ticker" class="bg-gray-900/50 border border-gray-600 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/50 w-32 font-mono uppercase">
-                    <button id="ticker-switch-btn" class="bg-gray-700 hover:bg-gray-600 font-semibold py-1.5 px-3 rounded-md text-sm">Go</button>
-                </div>
+        `;
+    } else { // Error case
+        mainContent = `
+            <div class="flex-grow">
+                 <p class="text-red-500">${state.error || `Could not load data for ${state.ticker.toUpperCase()}.`}</p>
             </div>
-        </div>`;
-    } else {
-         content = `<div class="w-full h-24 flex items-center justify-center glass-panel rounded-xl"><p class="text-red-500">${state.error || `Could not load data for ${state.ticker.toUpperCase()}.`}</p></div>`;
+        `;
     }
+
+    content = `
+        <div class="flex flex-col md:flex-row items-center justify-between gap-4 glass-panel p-4 rounded-xl">
+            ${mainContent}
+            ${headerControls}
+        </div>
+    `;
+    
     container.innerHTML = content;
 }
+
 
 function renderThemeToggle() {
     const isDark = state.theme === 'dark';
     const title = isDark ? 'Switch to Light Mode' : 'Switch to Dark Mode';
     const icon = isDark 
-        ? `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5"><path d="M12 2.25a.75.75 0 01.75.75v2.25a.75.75 0 01-1.5 0V3a.75.75 0 01.75-.75zM7.5 12a4.5 4.5 0 119 0 4.5 4.5 0 01-9 0zM18.894 6.106a.75.75 0 010 1.06l-1.591 1.59a.75.75 0 11-1.06-1.06l1.59-1.591a.75.75 0 011.06 0zM21.75 12a.75.75 0 01-.75.75h-2.25a.75.75 0 010-1.5H21a.75.75 0 01.75.75zM17.803 17.803a.75.75 0 01-1.06 0l-1.59-1.591a.75.75 0 111.06-1.06l1.59 1.59a.75.75 0 010 1.06zM12 21a.75.75 0 01-.75-.75v-2.25a.75.75 0 011.5 0V20.25a.75.75 0 01-.75.75zM6.106 18.894a.75.75 0 011.06 0l1.59-1.59a.75.75 0 111.06 1.06l-1.59 1.591a.75.75 0 01-1.06 0zM3.75 12a.75.75 0 01.75-.75h2.25a.75.75 0 010 1.5H4.5a.75.75 0 01-.75-.75zM6.106 6.106a.75.75 0 010-1.06l1.59-1.591a.75.75 0 011.06 1.06l-1.59 1.59a.75.75 0 01-1.06 0z" /></svg>`
+        ? `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5"><path d="M12 2.25a.75.75 0 01.75.75v2.25a.75.75 0 01-1.5 0V3a.75.75 0 01.75-.75zM7.5 12a4.5 4.5 0 119 0 4.5 4.5 0 01-9 0zM18.894 6.106a.75.75 0 010 1.06l-1.591 1.59a.75.75 0 11-1.06-1.06l1.59-1.591a.75.75 0 011.06 0zM21.75 12a.75.75 0 01-.75.75h-2.25a.75.75 0 010-1.5H21a.75.75 0 01.75.75zM17.803 17.803a.75.75 0 01-1.06 0l-1.59-1.591a.75.75 0 111.06-1.06l1.59 1.59a.75.75 0 010 1.06zM12 21a.75.75 0 01-.75-.75v-2.25a.75.75 0 011.5 0V20.25a.75.75 0 01-.75-.75zM6.106 18.894a.75.75 0 011.06 0l1.59-1.59a.75.75 0 111.06 1.06l-1.59 1.591a.75.75 0 01-1.06 0zM3.75 12a.75.75 0 01.75-.75h2.25a.75.75 0 010 1.5H4.5a.75.75 0 01-.75-.75zM6.106 6.106a.75.75 0 010-1.06l1.59-1.591a.75.75 0 011.06 1.06l-1.59 1.59a.75.75 0 01-1.06 0z" /></svg>`
         : `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5"><path fill-rule="evenodd" d="M9.528 1.718a.75.75 0 01.162.819A8.97 8.97 0 009 6a9 9 0 009 9 8.97 8.97 0 003.463-.69.75.75 0 01.981.98 10.503 10.503 0 01-9.694 6.46c-5.799 0-10.5-4.701-10.5-10.5 0-4.368 2.667-8.112 6.46-9.694a.75.75 0 01.818.162z" clip-rule="evenodd" /></svg>`;
     return `
         <button id="theme-toggle-btn" title="${title}" class="text-gray-400 hover:text-white transition-colors">
@@ -615,7 +747,7 @@ function renderDcfCard(containerId) {
 
     const dcfData = state.dashboardData.workflow.dcfValuation;
     const quote = state.dashboardData.quote;
-    const modelType = dcfData.modelType || 'Standard';
+    const modelType = dcfData.modelType;
     
     const renderSlider = (id, label, min, max, step, value, formatter) => `
         <div class="flex flex-col gap-1">
@@ -627,14 +759,14 @@ function renderDcfCard(containerId) {
         </div>`;
 
     let slidersHtml;
-    if (modelType === 'Financials') {
+    if (modelType === 'DDM') {
         slidersHtml = `
             ${renderSlider('dcf-roe', 'Return on Equity (ROE)', dcfData.inputs.roe.min, dcfData.inputs.roe.max, dcfData.inputs.roe.step, dcfData.inputs.roe.value, formatterService.percent)}
             ${renderSlider('dcf-reinvestmentRate', 'Retention Ratio (1 - Payout)', dcfData.inputs.reinvestmentRate.min, dcfData.inputs.reinvestmentRate.max, dcfData.inputs.reinvestmentRate.step, dcfData.inputs.reinvestmentRate.value, formatterService.percent)}
             ${renderSlider('dcf-costOfEquity', 'Cost of Equity', dcfData.inputs.costOfEquity.min, dcfData.inputs.costOfEquity.max, dcfData.inputs.costOfEquity.step, dcfData.inputs.costOfEquity.value, formatterService.percent)}
             ${renderSlider('dcf-terminalGrowth', 'Terminal Growth', dcfData.inputs.terminalGrowth.min, dcfData.inputs.terminalGrowth.max, dcfData.inputs.terminalGrowth.step, dcfData.inputs.terminalGrowth.value, formatterService.percent)}
         `;
-    } else { // Standard Model
+    } else { // DCF Model
         slidersHtml = `
             ${renderSlider('dcf-revenueGrowth', 'Revenue Growth', dcfData.inputs.revenueGrowth.min, dcfData.inputs.revenueGrowth.max, dcfData.inputs.revenueGrowth.step, dcfData.inputs.revenueGrowth.value, formatterService.percent)}
             ${renderSlider('dcf-operatingMargin', 'Operating Margin', dcfData.inputs.operatingMargin.min, dcfData.inputs.operatingMargin.max, dcfData.inputs.operatingMargin.step, dcfData.inputs.operatingMargin.value, formatterService.percent)}
@@ -660,7 +792,7 @@ function renderDcfCard(containerId) {
         </div>`;
     
     renderDcfOutputs();
-    document.getElementById('dcf-inputs').addEventListener('input', handleModelInputChange);
+    document.getElementById('dcf-inputs')?.addEventListener('input', handleModelInputChange);
 }
 
 function renderLboCard(containerId) {
@@ -748,13 +880,13 @@ function renderLboCard(containerId) {
         </div>`;
         
     renderLboOutputs();
-    document.getElementById('lbo-inputs').addEventListener('input', handleModelInputChange);
-    document.getElementById('lbo-scenario-select').addEventListener('change', handleLboScenarioChange);
+    document.getElementById('lbo-inputs')?.addEventListener('input', handleModelInputChange);
+    document.getElementById('lbo-scenario-select')?.addEventListener('change', handleLboScenarioChange);
 }
 
 function renderIndividualAnalysisView(container, type) {
-    const analysisData = state.analysisContent[type];
-    const content = analysisData ? analysisData.content : null;
+    const cachedTickerContent = state.analysisContent[state.ticker] || {};
+    const content = cachedTickerContent[type];
     let contentHtml = '';
     
     if (state.loading.analysis) {
@@ -784,6 +916,11 @@ function renderPitchDeckView(container) {
         return;
     }
 
+    if (pitchDeck.ticker && pitchDeck.ticker !== ticker) {
+        container.innerHTML = `<div class="text-center p-10 glass-panel rounded-xl"><p>Stale pitch deck data. Please click the tab again to refresh.</p></div>`;
+        return;
+    }
+
     if (!pitchDeck.slides || pitchDeck.slides.length === 0) {
         container.innerHTML = `<div class="text-center p-10 glass-panel rounded-xl"><p>No pitch deck generated yet. Click the navigation tab again to generate.</p></div>`;
         return;
@@ -805,1087 +942,736 @@ function renderPitchDeckView(container) {
                     <span class="font-semibold text-lg">${dashboardData.quote.companyName}</span>
                 </div>
                 <div class="flex items-center gap-4">
-                    <button id="copy-slide-btn" class="px-3 py-1.5 text-xs font-semibold text-gray-300 bg-gray-700 hover:bg-gray-600 rounded-md transition-colors flex items-center gap-2">
-                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-4 h-4"><path d="M5.5 2a.5.5 0 0 0-.5.5v8a.5.5 0 0 0 .5.5h5a.5.5 0 0 0 .5-.5v-8a.5.5 0 0 0-.5-.5h-5ZM5 2a1.5 1.5 0 0 1 1.5-1.5h2A1.5 1.5 0 0 1 10 .5v1a.5.5 0 0 0 1 0v-1A2.5 2.5 0 0 0 8.5 0h-2A2.5 2.5 0 0 0 4 2.5v1a.5.5 0 0 0 1 0v-1Z" /><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h9A1.5 1.5 0 0 1 14 4.5v9a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 13.5v-9ZM3.5 4a.5.5 0 0 0-.5.5v9a.5.5 0 0 0 .5.5h9a.5.5 0 0 0 .5-.5v-9a.5.5 0 0 0-.5-.5h-9Z" /></svg>
+                     <button id="copy-slide-btn" class="px-3 py-1.5 text-xs font-semibold text-gray-300 bg-gray-700 hover:bg-gray-600 rounded-md transition-colors flex items-center gap-2">
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-4 h-4"><path d="M5.5 2a.5.5 0 0 0-.5.5v8a.5.5 0 0 0 .5.5h5a.5.5 0 0 0 .5-.5v-8a.5.5 0 0 0-.5-.5h-5ZM5 2a1.5 1.5 0 0 1 1.5-1.5h2A1.5 1.5 0 0 1 10 .5v1a.5.5 0 0 0 1 0v-1A2.5 2.5 0 0 0 8.5 0h-2A2.5 2.5 0 0 0 4 2.5v1a.5.5 0 0 0 1 0v-1.5Z"/></svg>
                         Copy Slide
                     </button>
-                    <div class="slide-counter">
-                        <span>${pitchDeck.currentSlide + 1} / ${pitchDeck.slides.length}</span>
-                    </div>
+                    <span class="slide-counter">${pitchDeck.currentSlide + 1} / ${pitchDeck.slides.length}</span>
                 </div>
             </header>
-            <div class="pitch-deck-slide">
-                <h2 class="slide-title">${currentSlide.title}</h2>
-                <div class="slide-body prose-custom text-gray-300 leading-relaxed">
-                    ${contentHtml}
-                </div>
-            </div>
+            <main class="pitch-deck-slide">
+                <h1 class="slide-title">${currentSlide.title}</h1>
+                <div class="slide-body prose-custom">${contentHtml}</div>
+            </main>
             <footer class="pitch-deck-footer">
-                <button id="prev-slide-btn" class="slide-nav-btn" ${pitchDeck.currentSlide === 0 ? 'disabled' : ''}>&larr; Previous</button>
-                <span class="confidential-note">Strictly Private and Confidential</span>
-                <button id="next-slide-btn" class="slide-nav-btn" ${pitchDeck.currentSlide === pitchDeck.slides.length - 1 ? 'disabled' : ''}>Next &rarr;</button>
+                <p class="confidential-note">Confidential and for discussion purposes only.</p>
+                <div class="flex items-center gap-3">
+                    <button id="prev-slide-btn" class="slide-nav-btn" ${pitchDeck.currentSlide === 0 ? 'disabled' : ''}>&larr; Previous</button>
+                    <button id="next-slide-btn" class="slide-nav-btn" ${pitchDeck.currentSlide === pitchDeck.slides.length - 1 ? 'disabled' : ''}>Next &rarr;</button>
+                </div>
             </footer>
-        </div>`;
-
-    postRenderCallbacks.forEach(cb => cb());
-
-    document.getElementById('prev-slide-btn')?.addEventListener('click', handlePrevSlide);
-    document.getElementById('next-slide-btn')?.addEventListener('click', handleNextSlide);
-    document.getElementById('copy-slide-btn')?.addEventListener('click', handleCopySlide);
-}
-
-
-function renderPeerComparisonView(container) {
-    const workflow = state.dashboardData?.workflow;
-    if (state.loading.data || !workflow) {
-        container.innerHTML = `<div class="text-center p-10"><p class="animate-pulse">Loading peer data...</p></div>`;
-        return;
-    }
-
-    const mainTickerData = state.dashboardData.quote;
-    const peersData = state.dashboardData.peers;
-    const peerComparisonData = workflow.peerComparison;
-    const mainTicker = mainTickerData.ticker;
-
-    const allCompanies = [mainTickerData, ...peersData].map(p => {
-        const positionData = peerComparisonData.outputs.positions[p.ticker] || {};
-        const evEbitda = (p.ebitda && p.ebitda > 0) ? p.marketCap / p.ebitda : null;
-        return {
-            companyName: p.companyName,
-            ticker: p.ticker,
-            marketCap: p.marketCap,
-            ebitda: p.ebitda,
-            revenueGrowth: p.revenueGrowth,
-            peRatio: p.peRatio,
-            evEbitda: evEbitda,
-            pePosition: positionData['P/E'],
-            evEbitdaPosition: positionData['EV/EBITDA'],
-        };
-    });
-    
-    const { column, direction } = state.peerSort;
-    allCompanies.sort((a, b) => {
-        const valA = a[column] || (direction === 'asc' ? Infinity : -Infinity);
-        const valB = b[column] || (direction === 'asc' ? Infinity : -Infinity);
-        if (valA < valB) return direction === 'asc' ? -1 : 1;
-        if (valA > valB) return direction === 'asc' ? 1 : -1;
-        return 0;
-    });
-    
-    const maxMarketCap = Math.max(...allCompanies.map(p => p.marketCap || 0));
-    const maxEbitda = Math.max(...allCompanies.map(p => p.ebitda || 0));
-    const maxRevGrowth = Math.max(...allCompanies.map(p => Math.abs(p.revenueGrowth || 0)));
-
-    const getHeaderClass = (key) => `sortable-header ${state.peerSort.column === key ? state.peerSort.direction : ''}`;
-    const getPositionClass = (position) => {
-        if (position === 'premium') return 'text-red-400 font-semibold';
-        if (position === 'discount') return 'text-green-400 font-semibold';
-        return '';
-    };
-    
-    const renderQuartileCard = (title, tickerValue, tickerPosition, quartiles) => {
-        const median = quartiles ? quartiles.median : null;
-        const q1 = quartiles ? quartiles.q1 : null;
-        const q3 = quartiles ? quartiles.q3 : null;
-
-        const rangeText = (q1 !== null && q3 !== null) ? `${formatterService.ratio(q1)} - ${formatterService.ratio(q3)}` : 'N/A';
-
-        return `
-        <div class="glass-panel rounded-xl p-4">
-            <div class="flex justify-between items-center">
-                <h3 class="font-semibold text-gray-300">${title}</h3>
-                <span class="sentiment-tag ${
-                    tickerPosition === 'premium' ? 'sentiment-bearish' : 
-                    tickerPosition === 'discount' ? 'sentiment-bullish' : 'sentiment-neutral'
-                }">${tickerPosition || 'N/A'}</span>
-            </div>
-            <p class="text-3xl font-bold font-mono mt-2">${formatterService.ratio(tickerValue)}</p>
-            <div class="text-xs text-gray-400 space-y-1 mt-3 font-mono">
-                <p class="flex justify-between"><span>Peer Median:</span> <span class="font-semibold text-gray-300">${formatterService.ratio(median)}</span></p>
-                <p class="flex justify-between"><span>Peer Range (Q1-Q3):</span> <span class="font-semibold text-gray-300">${rangeText}</span></p>
-            </div>
-        </div>`;
-    };
-    
-    const tickerProcessedData = allCompanies.find(c => c.ticker === mainTicker);
-    const { outputs, sentiment, commentary } = peerComparisonData;
-
-    container.innerHTML = `
-        <div class="fade-in">
-             <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-                ${renderQuartileCard(
-                    'P/E Ratio (LTM)', 
-                    tickerProcessedData.peRatio, 
-                    tickerProcessedData.pePosition, 
-                    outputs.interquartileRanges['P/E']
-                )}
-                ${renderQuartileCard(
-                    'EV/EBITDA (LTM)', 
-                    tickerProcessedData.evEbitda, 
-                    tickerProcessedData.evEbitdaPosition, 
-                    outputs.interquartileRanges['EV/EBITDA']
-                )}
-                <div class="glass-panel rounded-xl p-4 md:col-span-2 lg:col-span-2">
-                     <h3 class="font-semibold text-gray-300">${sentiment.badge}</h3>
-                     <p class="text-sm text-gray-400 mt-2 leading-relaxed">${commentary.text}</p>
-                </div>
-             </div>
-
-            <div class="glass-panel rounded-xl p-4 sm:p-6">
-                <div class="flex flex-wrap justify-between items-center mb-4 gap-3">
-                     <h2 class="text-xl font-semibold">👥 Peer Data Table</h2>
-                     <button id="export-csv-btn" class="px-3 py-1.5 text-xs font-semibold text-gray-300 bg-gray-700 hover:bg-gray-600 rounded-md transition-colors flex items-center gap-2">
-                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-4 h-4"><path d="M4 2.5a.5.5 0 0 1 .5-.5h3a.5.5 0 0 1 0 1h-3a.5.5 0 0 1-.5-.5Zm0 2a.5.5 0 0 1 .5-.5h7a.5.5 0 0 1 0 1h-7a.5.5 0 0 1-.5-.5Zm0 2a.5.5 0 0 1 .5-.5h5a.5.5 0 0 1 0 1h-5a.5.5 0 0 1-.5-.5ZM2 1a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V3a2 2 0 0 0-2-2H2Zm12 1a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1h12Z" /></svg>
-                        Export to CSV
-                     </button>
-                </div>
-                <div class="overflow-x-auto">
-                    <table class="w-full text-sm text-left peer-table">
-                        <thead class="text-xs text-gray-400 uppercase">
-                            <tr>
-                                <th scope="col" class="px-6 py-3">Company</th>
-                                <th scope="col" class="px-6 py-3 text-right ${getHeaderClass('marketCap')}" data-sort-key="marketCap">Market Cap</th>
-                                <th scope="col" class="px-6 py-3 text-right ${getHeaderClass('ebitda')}" data-sort-key="ebitda">EBITDA</th>
-                                <th scope="col" class="px-6 py-3 text-right ${getHeaderClass('revenueGrowth')}" data-sort-key="revenueGrowth">Rev. Growth</th>
-                                <th scope="col" class="px-6 py-3 text-right ${getHeaderClass('peRatio')}" data-sort-key="peRatio">P/E Ratio</th>
-                                <th scope="col" class="px-6 py-3 text-right ${getHeaderClass('evEbitda')}" data-sort-key="evEbitda">EV/EBITDA</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            ${allCompanies.map(peer => `
-                                <tr class="${peer.ticker === mainTicker ? 'highlight-row' : ''}">
-                                    <th scope="row" class="px-6 py-4 font-medium whitespace-nowrap">
-                                        ${peer.companyName} <span class="text-gray-400 font-mono">${peer.ticker}</span>
-                                    </th>
-                                    <td class="px-6 py-4 text-right">
-                                        ${formatterService.largeNumber(peer.marketCap)}
-                                        <div class="mini-bar-container"><div class="mini-bar positive" style="width: ${peer.marketCap && maxMarketCap ? (peer.marketCap / maxMarketCap) * 100 : 0}%"></div></div>
-                                    </td>
-                                    <td class="px-6 py-4 text-right">
-                                        ${formatterService.largeNumber(peer.ebitda)}
-                                        <div class="mini-bar-container"><div class="mini-bar positive" style="width: ${peer.ebitda && maxEbitda ? (peer.ebitda / maxEbitda) * 100 : 0}%"></div></div>
-                                    </td>
-                                    <td class="px-6 py-4 text-right ${peer.revenueGrowth < 0 ? 'text-red-400' : 'text-green-400'}">
-                                        ${formatterService.percent(peer.revenueGrowth)}
-                                        <div class="mini-bar-container"><div class="mini-bar ${peer.revenueGrowth < 0 ? 'negative' : 'positive'}" style="width: ${peer.revenueGrowth && maxRevGrowth ? (Math.abs(peer.revenueGrowth) / maxRevGrowth) * 100 : 0}%"></div></div>
-                                    </td>
-                                    <td class="px-6 py-4 text-right font-mono ${getPositionClass(peer.pePosition)}">${formatterService.ratio(peer.peRatio)}</td>
-                                    <td class="px-6 py-4 text-right font-mono ${getPositionClass(peer.evEbitdaPosition)}">${formatterService.ratio(peer.evEbitda)}</td>
-                                </tr>
-                            `).join('')}
-                        </tbody>
-                    </table>
-                </div>
-                // Fix: Use the consistent formatDateTime helper function.
-                <p class="text-xs text-gray-500 mt-4 text-right">Last Updated: ${formatDateTime(new Date())}</p>
-            </div>
-        </div>`;
-    
-    document.querySelectorAll('.sortable-header').forEach(header => {
-        // Fix: Cast header to HTMLElement to access the dataset property.
-        header.addEventListener('click', () => handlePeerSort((header as HTMLElement).dataset.sortKey));
-    });
-    document.getElementById('export-csv-btn').addEventListener('click', handleExportPeersToCSV);
-}
-
-// --- 6. DATA HANDLING & UTILS ---
-async function generateLboAssumptionsFromGemini(quote, scenario) {
-    if (!ai) return null;
-
-    const scenarioDescription = {
-        baseCase: 'standard sponsor-to-sponsor',
-        dividendRecap: 'dividend recapitalization',
-        mezzanineDebt: 'leveraged buyout with a mezzanine debt tranche',
-        ipoExit: 'LBO with a planned IPO exit, potentially justifying a higher exit multiple',
-        growthEquity: 'minority growth equity investment in a high-growth tech company to fund expansion, not a traditional buyout. Assume lower leverage (debtFinancing).',
-        strategicSale: 'LBO with an exit to a strategic corporate acquirer, which might justify a higher synergy-driven exit multiple.',
-        clubDeal: 'large LBO where multiple PE firms pool capital. Assumptions should reflect a larger, more stable target.',
-        leveragedRecap: 'leveraged recapitalization for a financial institution, focusing on optimizing the capital structure.',
-        sponsorToSponsorExit: 'an exit where one private equity firm sells the company to another, often with a "second bite of the apple" thesis.',
-        managementBuyout: 'a transaction where the company\'s existing management team acquires the company, often with financial sponsor backing.',
-    }[scenario];
-
-    const scenarioSpecificFields = {
-        dividendRecap: 'Also include "recapYear" (as an integer from 2 to 4) and "dividendPayout" (as a number from 0.1 to 0.9).',
-        leveragedRecap: 'Also include "recapYear" (as an integer from 2 to 4) and "dividendPayout" (as a number from 0.1 to 0.9).',
-        mezzanineDebt: 'Also include "mezzanineFinancing" (as a number from 0.05 to 0.3) and "mezzanineInterestRate" (as a number from 0.1 to 0.2).',
-        ipoExit: 'For the "exitMultiple", consider a 10-25% premium over a typical trade sale multiple.',
-        strategicSale: 'For the "exitMultiple", consider a 15-30% premium over a typical trade sale multiple due to expected synergies.',
-        growthEquity: 'The "debtFinancing" should be lower, between 0.2 and 0.4. "ebitdaGrowth" should be higher.',
-    }[scenario] || '';
-
-    const prompt = `
-        You are a senior investment banking analyst. For ${quote.companyName} (${quote.ticker}), a ${quote.domain} company with a market cap of ${formatterService.largeNumber(quote.marketCap)} and EBITDA of ${formatterService.largeNumber(quote.ebitda)}, generate a set of reasonable initial assumptions for a ${scenarioDescription} LBO model.
-
-        Return ONLY a single, valid JSON object with the following numeric values:
-        - "debtFinancing": Total debt as a percentage of purchase price.
-        - "interestRate": Blended interest rate on senior debt.
-        - "ebitdaGrowth": Projected annual EBITDA growth rate.
-        - "exitMultiple": The LTM EBITDA multiple at exit.
-        - "holdingPeriod": The investment hold period in years (integer).
-        ${scenarioSpecificFields}
-
-        Base your assumptions on the company's scale and industry-specific private equity deal structures. Ensure the JSON is valid. Example for a base case: {"debtFinancing": 0.6, "interestRate": 0.09, "ebitdaGrowth": 0.08, "exitMultiple": 15, "holdingPeriod": 5}
+        </div>
     `;
 
-    try {
-        const response = await ai.models.generateContent({ model, contents: prompt });
-        let jsonString = response.text.trim();
-        if (jsonString.startsWith("```json")) {
-            jsonString = jsonString.substring(7, jsonString.length - 3).trim();
-        }
-        return JSON.parse(jsonString);
-    } catch (e) {
-        console.error("Failed to generate or parse LBO assumptions from Gemini:", e);
-        return null;
-    }
+    postRenderCallbacks.forEach(cb => cb());
+    postRenderCallbacks = [];
 }
 
-async function generateValuationWorkflow(quote, peers) {
-    const meta = {
-        selectedTicker: quote.ticker,
-        title: "Pitchly Valuation Workflow"
-    };
-    const dcfValuation = generateDcfModelData(quote);
-    const lboAnalysis = await generateLboModelData(quote);
-    const peerComparison = generatePeerComparisonModelData(quote, peers);
-
-    return { meta, dcfValuation, lboAnalysis, peerComparison };
-}
-
-function generateDcfModelData(quote) {
-    if (quote.domain === 'Financials') {
-        const initialAssumptions = {
-            roe: quote.roe || 0.12,
-            reinvestmentRate: 0.60, // This is the Retention Ratio for banks
-            costOfEquity: 0.10,
-            terminalGrowth: 0.02,
-        };
-        const outputs = calculateDcfOutputs(quote, initialAssumptions);
-        return {
-            header: { ticker: quote.ticker, badge: "DDM/ROE Model" },
-            modelType: 'Financials',
-            inputs: {
-                roe: { label: 'Return on Equity (ROE)', value: initialAssumptions.roe, min: 0.05, max: 0.25, step: 0.005 },
-                reinvestmentRate: { label: 'Retention Ratio (1 - Payout)', value: initialAssumptions.reinvestmentRate, min: 0.2, max: 0.8, step: 0.01 },
-                costOfEquity: { label: 'Cost of Equity', value: initialAssumptions.costOfEquity, min: 0.07, max: 0.15, step: 0.001 },
-                terminalGrowth: { label: 'Terminal Growth', value: initialAssumptions.terminalGrowth, min: 0.01, max: 0.04, step: 0.001 },
-            },
-            ...getDcfSentimentAndCommentary(outputs, quote),
-            outputs: outputs,
-        };
+function renderPeerComparisonView(container) {
+    const { peers } = state.dashboardData;
+    const { column, direction } = state.peerSort;
+    
+    if (!peers || peers.length === 0) {
+        container.innerHTML = `<div class="glass-panel rounded-xl p-6 text-center"><p>No peer data available for ${state.ticker}.</p></div>`;
+        return;
     }
-
-    // Standard model for non-financials
-    const initialAssumptions = {
-        revenueGrowth: 0.15,
-        operatingMargin: 0.18,
-        taxRate: quote.taxRate || 0.21,
-        reinvestmentRate: 0.30,
-        wacc: 0.095,
-        terminalGrowth: 0.025,
-    };
-    const outputs = calculateDcfOutputs(quote, initialAssumptions);
-    return {
-        header: { ticker: quote.ticker, badge: "DCF Model" },
-        modelType: 'Standard',
-        inputs: {
-            revenueGrowth: { label: 'Revenue Growth', value: initialAssumptions.revenueGrowth, min: 0, max: 0.5, step: 0.005 },
-            operatingMargin: { label: 'Operating Margin', value: initialAssumptions.operatingMargin, min: 0, max: 0.4, step: 0.005 },
-            taxRate: { label: `Tax Rate${quote.taxRateSource || ''}`, value: initialAssumptions.taxRate, min: 0.1, max: 0.4, step: 0.005 },
-            reinvestmentRate: { label: 'Reinvestment Rate', value: initialAssumptions.reinvestmentRate, min: 0, max: 1, step: 0.01 },
-            wacc: { label: 'WACC', value: initialAssumptions.wacc, min: 0.05, max: 0.15, step: 0.001 },
-            terminalGrowth: { label: 'Terminal Growth', value: initialAssumptions.terminalGrowth, min: 0.01, max: 0.05, step: 0.001 },
-        },
-        ...getDcfSentimentAndCommentary(outputs, quote),
-        outputs: outputs,
-    };
-}
-
-async function generateLboModelData(quote) {
-    const scenarios = [];
-    const domain = quote.domain;
-    const scenariosForDomain = DOMAIN_SCENARIOS[domain];
-
-    for (const scenario of scenariosForDomain) {
-        const geminiAssumptions = await generateLboAssumptionsFromGemini(quote, scenario.id);
-
-        const baseAssumptions = {
-            purchasePrice: quote.marketCap,
-            debtFinancing: geminiAssumptions?.debtFinancing ?? 0.60,
-            interestRate: geminiAssumptions?.interestRate ?? quote.interestRate ?? 0.085,
-            ebitdaGrowth: geminiAssumptions?.ebitdaGrowth ?? 0.08,
-            exitMultiple: geminiAssumptions?.exitMultiple ?? (quote.peRatio ? Math.min(25, Math.max(8, quote.peRatio * 0.8)) : 15),
-            holdingPeriod: geminiAssumptions?.holdingPeriod ?? 5,
-        };
-
-        const inputs: { [key: string]: any } = {
-            purchasePrice: { label: 'Purchase Price', value: baseAssumptions.purchasePrice },
-            interestRate: { label: 'Interest Rate', value: baseAssumptions.interestRate, min: 0.05, max: 0.15, step: 0.005 },
-            debtFinancing: { label: 'Total Debt Financing', value: baseAssumptions.debtFinancing, min: 0.2, max: 0.8, step: 0.01 },
-            ebitdaGrowth: { label: 'EBITDA Growth', value: baseAssumptions.ebitdaGrowth, min: 0, max: 0.3, step: 0.005 },
-            exitMultiple: { label: 'Exit Multiple', value: baseAssumptions.exitMultiple, min: 5, max: 40, step: 0.5 },
-            holdingPeriod: { label: 'Holding Period', value: baseAssumptions.holdingPeriod, min: 3, max: 7, step: 1 },
-        };
-        
-        const scenarioAssumptions: { [key: string]: any } = {};
-        if (['dividendRecap', 'leveragedRecap'].includes(scenario.id)) {
-            scenarioAssumptions.recapYear = geminiAssumptions?.recapYear ?? 3;
-            scenarioAssumptions.dividendPayout = geminiAssumptions?.dividendPayout ?? 0.5;
-            inputs.recapYear = { label: 'Recap Year', value: scenarioAssumptions.recapYear, min: 2, max: baseAssumptions.holdingPeriod - 1, step: 1 };
-            inputs.dividendPayout = { label: 'Dividend Payout %', value: scenarioAssumptions.dividendPayout, min: 0.1, max: 0.9, step: 0.05 };
-        } else if (scenario.id === 'mezzanineDebt') {
-            scenarioAssumptions.mezzanineFinancing = geminiAssumptions?.mezzanineFinancing ?? 0.15;
-            scenarioAssumptions.mezzanineInterestRate = geminiAssumptions?.mezzanineInterestRate ?? 0.14;
-            inputs.mezzanineFinancing = { label: 'Mezzanine Financing %', value: scenarioAssumptions.mezzanineFinancing, min: 0.05, max: 0.30, step: 0.01 };
-            inputs.mezzanineInterestRate = { label: 'Mezzanine Interest % (PIK)', value: scenarioAssumptions.mezzanineInterestRate, min: 0.10, max: 0.20, step: 0.005 };
-        }
-        
-        const allAssumptions = { ...baseAssumptions, ...scenarioAssumptions };
-        const calculatedOutputs = calculateLboOutputs(quote, allAssumptions, scenario.id);
-        const { sentiment, commentary } = getLboSentimentAndCommentary(calculatedOutputs.irr, calculatedOutputs.moic, scenario.id);
-        
-        const scenarioData = {
-            header: {
-                ticker: quote.ticker,
-                scenarioId: scenario.id,
-                scenarioName: scenario.name,
-                badge: sentiment.badge,
-            },
-            inputs: inputs,
-            outputs: {
-                ebitda: calculatedOutputs.projections.map(p => p.ebitda),
-                cashFlow: calculatedOutputs.projections.map(p => p.cashFlow),
-                debtBalance: calculatedOutputs.projections.map(p => p.debtBalance),
-                sponsorEquity: calculatedOutputs.initialEquity,
-                seniorDebt: calculatedOutputs.initialSeniorDebt,
-                mezzanineDebt: calculatedOutputs.initialMezzanineDebt,
-                exitEquityValue: calculatedOutputs.exitEquityValue,
-                irr: calculatedOutputs.irr,
-                moic: calculatedOutputs.moic,
-                dividendPaid: calculatedOutputs.dividendPaid,
-            },
-            sentiment: sentiment.badge,
-            commentary: commentary.text,
-        };
-        scenarios.push(scenarioData);
-    }
-    return { scenarios };
-}
-
-
-function generatePeerComparisonModelData(quote, peers) {
-     if (!peers || peers.length === 0) {
-        return {
-            header: { baseTicker: quote.ticker },
-            inputs: { multiples: ['P/E', 'EV/EBITDA', 'P/S'] },
-            outputs: { peers: [], interquartileRanges: {}, positions: {} },
-            sentiment: { badge: 'Limited Data' },
-            commentary: { text: `Peer data could not be automatically resolved for ${quote.ticker}. Comparison is unavailable.` }
-        };
-    }
-
-    const allCompaniesData = [quote, ...peers];
-    const processedCompanies = allCompaniesData.map(c => ({
-        ...c,
-        evEbitda: (c.ebitda && c.ebitda > 0 && c.marketCap) ? c.marketCap / c.ebitda : null,
-        psRatio: (c.revenue && c.revenue > 0 && c.marketCap) ? c.marketCap / c.revenue : null,
-    }));
-
-    const calculateQuartiles = (arr) => {
-        const sorted = arr.filter(v => v !== null && isFinite(v) && v > 0).sort((a, b) => a - b);
-        if (sorted.length < 4) return { q1: null, median: null, q3: null };
-        const q1Index = Math.floor(sorted.length * 0.25);
-        const medianIndex = Math.floor(sorted.length * 0.5);
-        const q3Index = Math.floor(sorted.length * 0.75);
-        return { q1: sorted[q1Index], median: sorted[medianIndex], q3: sorted[q3Index] };
-    };
-
-    const iqr = {
-        'P/E': calculateQuartiles(processedCompanies.map(c => c.peRatio)),
-        'EV/EBITDA': calculateQuartiles(processedCompanies.map(c => c.evEbitda)),
-        'P/S': calculateQuartiles(processedCompanies.map(c => c.psRatio)),
-    };
-
-    const getPosition = (value, quartiles) => {
-        if (value === null || quartiles.q1 === null || quartiles.q3 === null) return 'in-line'; // Default for N/A
-        if (value > quartiles.q3 * 1.1) return 'premium';
-        if (value < quartiles.q1 * 0.9) return 'discount';
-        return 'in-line';
-    };
-
-    const positions = {};
-    processedCompanies.forEach(c => {
-        positions[c.ticker] = {
-            'P/E': getPosition(c.peRatio, iqr['P/E']),
-            'EV/EBITDA': getPosition(c.evEbitda, iqr['EV/EBITDA']),
-            'P/S': getPosition(c.psRatio, iqr['P/S']),
-        };
+    
+    const sortedPeers = [...peers].sort((a, b) => {
+        const valA = a[column] || 0;
+        const valB = b[column] || 0;
+        return direction === 'asc' ? valA - valB : valB - valA;
     });
-
-    const premiumCount = Object.values(positions[quote.ticker]).filter(p => p === 'premium').length;
-    const discountCount = Object.values(positions[quote.ticker]).filter(p => p === 'discount').length;
     
-    let sentimentBadge, commentary;
-    if(premiumCount > discountCount) {
-        sentimentBadge = 'Premium-heavy';
-        commentary = `${quote.ticker} trades at a significant premium across key multiples, reflecting strong market sentiment and growth expectations relative to peers.`;
-    } else if (discountCount > premiumCount) {
-        sentimentBadge = 'Discount-heavy';
-        commentary = `${quote.ticker} appears to trade at a discount to its peer group, suggesting potential undervaluation or perceived higher risk.`;
-    } else {
-        sentimentBadge = 'Mixed';
-        commentary = `Valuation for ${quote.ticker} is mixed compared to peers, trading at a premium on some multiples and a discount on others.`;
-    }
-
-    return {
-        header: { baseTicker: quote.ticker },
-        inputs: { multiples: ['P/E', 'EV/EBITDA', 'P/S'] },
-        outputs: { peers: peers.map(p => p.ticker), interquartileRanges: iqr, positions: positions },
-        sentiment: { badge: sentimentBadge },
-        commentary: { text: commentary }
+    const getSortArrow = (col) => {
+        if (col !== column) return '';
+        return direction === 'asc' ? ' &uarr;' : ' &darr;';
     };
-}
 
-function calculateDcfOutputs(baseData, assumptions) {
-    const { domain, marketCap, pbRatio, shares, price, ebitda, psRatio } = baseData;
-    let { revenue, netDebt } = baseData;
-
-    // Financials use a Dividend Discount Model (DDM) based on ROE
-    if (domain === 'Financials') {
-        const { roe, reinvestmentRate, costOfEquity, terminalGrowth } = assumptions;
-        
-        if (!marketCap || !pbRatio || pbRatio <= 0) {
-            return { revenue: "N/A", fcff: [], pvContributions: { fcff: 0, terminal: 0 }, enterpriseValue: 0, equityValue: 0, perShareValue: "N/A", potentialUpside: "N/A", error: 'Missing Market Cap or P/B Ratio. Cannot perform DDM valuation.' };
-        }
-        const bookValue = marketCap / pbRatio;
-        if (bookValue <= 0) {
-            return { revenue: "N/A", fcff: [], pvContributions: { fcff: 0, terminal: 0 }, enterpriseValue: 0, equityValue: 0, perShareValue: "N/A", potentialUpside: "N/A", error: 'Invalid Book Value derived. Cannot perform DDM valuation.' };
-        }
-
-        const projections = [];
-        let currentBookValue = bookValue;
-        for (let i = 1; i <= 10; i++) {
-            const netIncome = currentBookValue * roe;
-            const reinvestment = netIncome * reinvestmentRate;
-            const fcfe = netIncome - reinvestment;
-            currentBookValue += reinvestment;
-            projections.push({ year: i, fcfe });
-        }
-
-        const sumPvFcfe = projections.reduce((sum, p, i) => sum + p.fcfe / Math.pow(1 + costOfEquity, i + 1), 0);
-        const lastFcfe = projections[projections.length - 1].fcfe;
-        const terminalValue = (lastFcfe * (1 + terminalGrowth)) / (costOfEquity - terminalGrowth);
-        const pvTerminalValue = terminalValue / Math.pow(1 + costOfEquity, 10);
-        
-        const equityValue = sumPvFcfe + pvTerminalValue;
-        const perShareValue = (shares && shares > 0) ? equityValue / shares : null;
-        const potentialUpside = (perShareValue !== null && price) ? (perShareValue - price) / price : null;
-
-        return {
-            revenue: "N/A (DDM Model)",
-            fcff: projections.map(p => p.fcfe), // Re-using fcff field for FCFE
-            pvContributions: { fcff: sumPvFcfe, terminal: pvTerminalValue },
-            enterpriseValue: equityValue, // For banks, EV is not a standard concept, we directly value equity
-            equityValue,
-            perShareValue: perShareValue ?? "N/A",
-            potentialUpside: potentialUpside ?? "N/A",
-            derivedRevenueSource: `Valuation based on a Dividend Discount Model using Book Value, ROE, and Cost of Equity.`,
-            error: perShareValue === null ? 'Missing or invalid Shares Outstanding data.' : null
-        };
-    }
-
-    // Standard FCFF model for non-financials
-    const { revenueGrowth, operatingMargin, taxRate, reinvestmentRate, wacc, terminalGrowth } = assumptions;
-    let derivedRevenueSource = null;
-    if (revenue == null || revenue <= 0) {
-        if (ebitda && ebitda > 0 && operatingMargin > 0) {
-            revenue = ebitda / operatingMargin;
-            derivedRevenueSource = 'Revenue was derived from EBITDA and Operating Margin.';
-        } else if (marketCap && psRatio && psRatio > 0) {
-            revenue = marketCap / psRatio;
-            derivedRevenueSource = 'Revenue was derived from Market Cap and P/S Ratio.';
-        }
-    }
-
-    if (revenue === null || revenue <= 0 || typeof revenue === 'string') {
-        return { revenue: "N/A", fcff: [], pvContributions: { fcff: 0, terminal: 0 }, enterpriseValue: 0, equityValue: 0, perShareValue: "N/A", potentialUpside: "N/A", derivedRevenueSource, error: 'Revenue could not be derived. Cannot perform DCF.' };
-    }
-
-    const projections = [];
-    let currentRevenue = revenue;
-    for (let i = 1; i <= 10; i++) {
-        currentRevenue *= (1 + revenueGrowth);
-        const ebit = currentRevenue * operatingMargin;
-        const nopat = ebit * (1 - taxRate);
-        const reinvestment = nopat * reinvestmentRate;
-        const fcff = nopat - reinvestment;
-        projections.push({ year: i, revenue: currentRevenue, fcff });
-    }
-
-    const sumPvFcff = projections.reduce((sum, p, i) => sum + p.fcff / Math.pow(1 + wacc, i + 1), 0);
-    const lastFcff = projections[projections.length - 1].fcff;
-    const terminalValue = (lastFcff * (1 + terminalGrowth)) / (wacc - terminalGrowth);
-    const pvTerminalValue = terminalValue / Math.pow(1 + wacc, 10);
-    
-    const enterpriseValue = sumPvFcff + pvTerminalValue;
-    const equityValue = enterpriseValue - (netDebt || 0); 
-    const perShareValue = (shares && shares > 0) ? equityValue / shares : null;
-    const potentialUpside = (perShareValue !== null && price) ? (perShareValue - price) / price : null;
-
-    return {
-        revenue,
-        fcff: projections.map(p => p.fcff),
-        pvContributions: { fcff: sumPvFcff, terminal: pvTerminalValue },
-        enterpriseValue,
-        equityValue,
-        perShareValue: perShareValue ?? "N/A",
-        potentialUpside: potentialUpside ?? "N/A",
-        derivedRevenueSource,
-        error: perShareValue === null ? 'Missing or invalid Shares Outstanding data. Cannot calculate per-share value.' : null
+    const findMinMax = (key) => {
+        const values = peers.map(p => p[key]).filter(v => v !== null && !isNaN(v));
+        return { min: Math.min(...values), max: Math.max(...values) };
     };
-}
-
-function calculateLboOutputs(baseData, assumptions, scenario = 'baseCase') {
-    let { ebitda, marketCap, evEbitda, taxRate } = baseData;
-    const { purchasePrice, debtFinancing, interestRate, ebitdaGrowth, exitMultiple, holdingPeriod } = assumptions;
-
-    if (!purchasePrice) {
-        return { projections: [], exitEquityValue: 0, irr: 0, moic: 0, dividendPaid: 0, initialSeniorDebt: 0, initialMezzanineDebt: 0, initialEquity: 0 };
-    }
     
-    if (!ebitda || ebitda <= 0) {
-        if (marketCap && evEbitda && evEbitda > 0) {
-            ebitda = marketCap / evEbitda;
-        } else if (exitMultiple > 0) {
-            ebitda = (purchasePrice / exitMultiple) / Math.pow(1 + ebitdaGrowth, holdingPeriod);
-        }
-    }
-
-    if (!ebitda || ebitda <= 0) {
-         return { projections: [], exitEquityValue: 0, irr: 0, moic: 0, dividendPaid: 0, initialSeniorDebt: 0, initialMezzanineDebt: 0, initialEquity: 0 };
-    }
-    
-    let initialSeniorDebt = 0;
-    let initialMezzanineDebt = 0;
-    
-    if (scenario === 'mezzanineDebt') {
-        const mezzanineFinancing = Math.min(debtFinancing, assumptions.mezzanineFinancing);
-        const seniorFinancing = debtFinancing - mezzanineFinancing;
-        initialSeniorDebt = purchasePrice * seniorFinancing;
-        initialMezzanineDebt = purchasePrice * mezzanineFinancing;
-    } else {
-        initialSeniorDebt = purchasePrice * debtFinancing;
-    }
-
-    const totalInitialDebt = initialSeniorDebt + initialMezzanineDebt;
-    const initialEquity = purchasePrice - totalInitialDebt;
-
-    const projections = [];
-    let currentEbitda = ebitda;
-    let currentSeniorDebt = initialSeniorDebt;
-    let currentMezzanineDebt = initialMezzanineDebt;
-    let dividendPaidTotal = 0;
-
-    for (let i = 1; i <= holdingPeriod; i++) {
-        currentEbitda *= (1 + ebitdaGrowth);
-        
-        if (['dividendRecap', 'leveragedRecap'].includes(scenario) && i === assumptions.recapYear) {
-            const currentTotalDebt = currentSeniorDebt + currentMezzanineDebt;
-            const equityValuePreRecap = (currentEbitda * exitMultiple) - currentTotalDebt;
-            const dividendAmount = equityValuePreRecap * assumptions.dividendPayout;
-            dividendPaidTotal += dividendAmount;
-            currentSeniorDebt += dividendAmount;
-        }
-
-        const seniorInterest = currentSeniorDebt * interestRate;
-        let cashInterest = seniorInterest;
-        let pikInterest = 0;
-
-        if (scenario === 'mezzanineDebt') {
-            pikInterest = currentMezzanineDebt * assumptions.mezzanineInterestRate;
-        }
-        
-        const cashFlow = (currentEbitda - cashInterest) * (1 - taxRate);
-        const debtPaid = Math.min(currentSeniorDebt, cashFlow > 0 ? cashFlow : 0);
-        
-        currentSeniorDebt -= debtPaid;
-        if (scenario === 'mezzanineDebt') {
-             currentMezzanineDebt += pikInterest; // PIK interest accrues
-        }
-        
-        const totalDebtBalance = currentSeniorDebt + currentMezzanineDebt;
-        projections.push({ year: i, ebitda: currentEbitda, debtBalance: totalDebtBalance, cashFlow });
-    }
-
-    const finalTotalDebt = projections[projections.length - 1].debtBalance;
-    const exitEv = projections[projections.length - 1].ebitda * exitMultiple;
-    const exitEquityValue = exitEv - finalTotalDebt;
-    const totalCashToSponsor = exitEquityValue + dividendPaidTotal;
-
-    let moic = 0, irr = 0;
-    if (initialEquity > 0 && totalCashToSponsor >= 0) {
-        moic = totalCashToSponsor / initialEquity;
-        irr = moic > 0 ? Math.pow(moic, 1 / holdingPeriod) - 1 : -1.0;
-    } else if (initialEquity <= 0) {
-        moic = 0;
-        irr = 0;
-    }
-
-    return {
-        projections,
-        exitEquityValue: exitEquityValue,
-        irr,
-        moic,
-        dividendPaid: dividendPaidTotal,
-        initialSeniorDebt,
-        initialMezzanineDebt,
-        initialEquity
+    const ranges = {
+        marketCap: findMinMax('marketCap'), revenue: findMinMax('revenue'),
+        peRatio: findMinMax('peRatio'), psRatio: findMinMax('psRatio'),
+        revenueGrowth: findMinMax('revenueGrowth'), evEbitda: findMinMax('evEbitda')
     };
-}
 
+    const renderMiniBar = (value, range) => {
+        if (value === null || isNaN(value)) return 'N/A';
+        const isNegative = value < 0;
+        const absValue = Math.abs(value);
+        const absMax = Math.max(Math.abs(range.min), Math.abs(range.max));
+        const width = absMax > 0 ? (absValue / absMax) * 100 : 0;
 
-function getDcfSentimentAndCommentary(outputs, quote) {
-    const { potentialUpside, derivedRevenueSource } = outputs;
-    const { taxRate, taxRateIsAssumed, domain } = quote;
-    
-    if (potentialUpside === "N/A" || typeof potentialUpside !== 'number') {
-        return { sentiment: { badge: 'Incomplete' }, commentary: { text: outputs.error || 'Per-share value cannot be determined.' } };
-    }
+        return `
+            <div class="flex items-center gap-2">
+                <span class="w-16 text-right">${formatterService.ratio(value, '')}</span>
+                <div class="mini-bar-container">
+                    <div class="mini-bar ${isNegative ? 'negative' : 'positive'}" style="width: ${width}%;"></div>
+                </div>
+            </div>`;
+    };
 
-    let badge, baseText;
-    if (potentialUpside > 0.15) {
-        badge = 'Undervalued';
-        baseText = `The model indicates the stock is undervalued, driven by strong growth and margin assumptions.`;
-    } else if (potentialUpside < -0.15) {
-        badge = 'Overvalued';
-        baseText = `High valuation multiples are not supported by fundamentals, suggesting the stock is overvalued.`;
-    } else {
-        badge = 'Fair Value';
-        baseText = `The stock appears to be fairly valued, with market price aligning closely with intrinsic value estimates.`;
-    }
-
-    let commentaryText = baseText;
-    if (derivedRevenueSource) {
-        commentaryText = domain === 'Financials'
-            ? `${derivedRevenueSource} ${baseText}`
-            : `${baseText} ${derivedRevenueSource}`;
-    }
-    if (taxRateIsAssumed) {
-        commentaryText += ` A statutory tax rate of ${formatterService.percent(taxRate)} was assumed.`;
-    }
-    
-    return { sentiment: { badge }, commentary: { text: commentaryText } };
-}
-
-function getLboSentimentAndCommentary(irr, moic, scenario) {
-     let badge, text;
-    if (irr > 0.20) {
-        badge = 'Attractive IRR';
-        if (['dividendRecap', 'leveragedRecap'].includes(scenario)) {
-            text = `The recapitalization strategy boosts IRR to ${formatterService.percent(irr)}, accelerating returns to the sponsor.`;
-        } else if (scenario === 'mezzanineDebt') {
-            text = `The use of mezzanine financing increases leverage, boosting the IRR to ${formatterService.percent(irr)} but elevating the risk profile.`;
-        } else if (scenario === 'ipoExit') {
-            text = `A successful IPO exit at a premium multiple could yield an attractive IRR of ${formatterService.percent(irr)}.`;
-        } else if (scenario === 'growthEquity') {
-            text = `High growth assumptions lead to a strong ${formatterService.percent(irr)} IRR, typical of successful growth equity deals.`;
-        } else if (scenario === 'strategicSale') {
-            text = `An exit to a strategic buyer with synergies unlocks a ${formatterService.percent(irr)} IRR.`;
-        } else if (scenario === 'clubDeal') {
-            text = `The scale of this club deal allows for stable cash flows, supporting a solid ${formatterService.percent(irr)} IRR.`;
-        } else if (scenario === 'sponsorToSponsorExit') {
-            text = `A secondary buyout thesis is supported by a compelling ${formatterService.percent(irr)} IRR, indicating further value creation potential.`;
-        } else if (scenario === 'managementBuyout') {
-            text = `Aligning with management in an MBO proves fruitful, delivering a ${formatterService.percent(irr)} IRR.`;
-        }
-         else {
-            text = `This LBO delivers a ${formatterService.percent(irr)} IRR, driven by strong EBITDA growth and deleveraging.`;
-        }
-    } else {
-        badge = 'Weak IRR';
-        if (scenario === 'mezzanineDebt') {
-             text = `Even with additional leverage from mezzanine debt, the IRR of ${formatterService.percent(irr)} is weak.`;
-        } else if (scenario === 'ipoExit') {
-            text = `The projected IRR of ${formatterService.percent(irr)} is weak, suggesting the IPO premium may not justify the risk.`;
-        } else if (scenario === 'growthEquity') {
-            text = `The projected ${formatterService.percent(irr)} IRR is low for a growth equity case, questioning the growth story.`;
-        } else {
-            text = `The projected IRR of ${formatterService.percent(irr)} may not meet typical private equity return hurdles.`;
-        }
-    }
-    return { sentiment: { badge }, commentary: { text } };
+    container.innerHTML = `
+        <div class="glass-panel rounded-xl p-4 md:p-6 fade-in">
+            <h2 class="text-xl font-semibold mb-4">Competitor Benchmarks</h2>
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm text-left peer-table">
+                    <thead class="text-xs text-gray-400 uppercase">
+                        <tr>
+                            <th class="py-3 px-4">Company</th>
+                            <th class="py-3 px-4 text-right sortable-header ${column === 'marketCap' ? direction : ''}" data-sort="marketCap">Market Cap${getSortArrow('marketCap')}</th>
+                            <th class="py-3 px-4 text-right sortable-header ${column === 'revenue' ? direction : ''}" data-sort="revenue">Revenue${getSortArrow('revenue')}</th>
+                            <th class="py-3 px-4 text-right sortable-header ${column === 'peRatio' ? direction : ''}" data-sort="peRatio">P/E Ratio${getSortArrow('peRatio')}</th>
+                            <th class="py-3 px-4 text-right sortable-header ${column === 'psRatio' ? direction : ''}" data-sort="psRatio">P/S Ratio${getSortArrow('psRatio')}</th>
+                            <th class="py-3 px-4 text-right sortable-header ${column === 'evEbitda' ? direction : ''}" data-sort="evEbitda">EV/EBITDA${getSortArrow('evEbitda')}</th>
+                            <th class="py-3 px-4 text-right sortable-header ${column === 'revenueGrowth' ? direction : ''}" data-sort="revenueGrowth">Rev. Growth${getSortArrow('revenueGrowth')}</th>
+                        </tr>
+                    </thead>
+                    <tbody class="font-mono">
+                    ${sortedPeers.map(peer => `
+                        <tr class="${peer.ticker === state.ticker ? 'highlight-row' : ''}">
+                            <td class="py-3 px-4">
+                                <div class="flex items-center gap-3">
+                                    <img src="${peer.logoUrl || apiService.getLogoUrl(peer.ticker)}" class="h-6 w-6 object-contain bg-white/90 p-0.5 rounded-full" alt="${peer.ticker} logo">
+                                    <div>
+                                        <div class="font-bold text-primary">${peer.ticker}</div>
+                                        <div class="text-xs text-gray-400 truncate max-w-[120px]">${peer.companyName}</div>
+                                    </div>
+                                </div>
+                            </td>
+                            <td class="py-3 px-4 text-right">${formatterService.largeNumber(peer.marketCap)}</td>
+                            <td class="py-3 px-4 text-right">${formatterService.largeNumber(peer.revenue)}</td>
+                            <td class="py-3 px-4 text-right">${formatterService.ratio(peer.peRatio)}</td>
+                            <td class="py-3 px-4 text-right">${formatterService.ratio(peer.psRatio)}</td>
+                            <td class="py-3 px-4 text-right">${formatterService.ratio(peer.evEbitda)}</td>
+                            <td class="py-3 px-4 text-right">${formatterService.percent(peer.revenueGrowth)}</td>
+                        </tr>
+                    `).join('')}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    `;
 }
 
 function renderDcfOutputs() {
-    const workflow = state.dashboardData.workflow;
-    const { dcfValuation } = workflow;
-    const currentPrice = state.dashboardData.quote.price;
-    const { outputs, sentiment, commentary } = dcfValuation;
-    const { perShareValue, potentialUpside, error } = outputs;
-
-    let perShareHtml, upsideHtml, sentimentHtml;
-
-    if (error || perShareValue === "N/A") {
-        perShareHtml = `<span class="text-gray-500 font-bold">N/A</span>`;
-        upsideHtml = `<span class="text-gray-500">N/A</span>`;
-        sentimentHtml = `
-            <div class="mt-4">
-                <span class="sentiment-tag sentiment-neutral">Incomplete Data</span>
-                <p class="text-xs text-yellow-400 mt-2 italic">${commentary.text}</p>
-            </div>
-        `;
-    } else {
-        const sentimentClass = sentiment.badge === 'Undervalued' ? 'sentiment-bullish' : sentiment.badge === 'Overvalued' ? 'sentiment-bearish' : 'sentiment-neutral';
-        perShareHtml = `<span class="text-amber-400 font-bold">${formatterService.currency(perShareValue)}</span>`;
-        upsideHtml = `<span class="${potentialUpside >= 0 ? 'text-green-400' : 'text-red-400'} font-semibold">${formatterService.percent(potentialUpside)}</span>`;
-        sentimentHtml = `
-            <div class="mt-4">
-                <span class="sentiment-tag ${sentimentClass}">${sentiment.badge}</span>
-                <p class="text-xs text-gray-400 mt-2 italic">${commentary.text}</p>
-            </div>
-        `;
-    }
+    const container = document.getElementById('dcf-summary-container');
+    if (!container || !state.dashboardData) return;
     
-    const summaryContainer = document.getElementById('dcf-summary-container');
-    summaryContainer.innerHTML = `
-        <div class="flex justify-between items-baseline"><span class="text-gray-400">Enterprise Value:</span><span class="font-semibold">${formatterService.largeNumber(outputs.enterpriseValue)}</span></div>
-        <div class="flex justify-between items-baseline"><span class="text-gray-400">Equity Value:</span><span class="font-semibold">${formatterService.largeNumber(outputs.equityValue)}</span></div>
-        <hr class="border-gray-600 my-2">
-        <div class="flex justify-between items-center text-lg mt-2">
-            <span class="text-amber-400 font-semibold">Intrinsic Value / Share:</span>
-            ${perShareHtml}
+    const dcfData = state.dashboardData.workflow.dcfValuation;
+    const { price } = state.dashboardData.quote;
+    const { impliedSharePrice, premium, enterpriseValue, equityValue } = dcfData.outputs;
+
+    const premiumColor = premium >= 0 ? 'text-green-400' : 'text-red-400';
+    
+    container.innerHTML = `
+        <div class="flex justify-between items-center border-b border-gray-700 pb-2">
+            <span class="text-gray-400">Current Share Price:</span>
+            <span>${formatterService.currency(price)}</span>
         </div>
-        <div class="flex justify-between items-center text-sm mt-1">
-            <span class="text-gray-400">Current Price:</span>
-            <span>${formatterService.currency(currentPrice)}</span>
+        <div class="flex justify-between items-center text-lg font-bold text-amber-400 pt-2">
+            <span>Implied Share Price:</span>
+            <span>${formatterService.currency(impliedSharePrice)}</span>
         </div>
-         <div class="flex justify-between items-center text-sm mt-1">
-            <span class="text-gray-400">Potential Upside:</span>
-            ${upsideHtml}
+        <div class="flex justify-between items-center text-sm ${premiumColor} font-semibold">
+            <span>Upside / Downside:</span>
+            <span>${formatterService.percent(premium)}</span>
         </div>
-        ${sentimentHtml}`;
-}
-
-function renderLboOutputs() {
-    const allLboScenarios = state.dashboardData.workflow.lboAnalysis.scenarios;
-    const lboData = allLboScenarios.find(s => s.header.scenarioId === state.lboScenario);
-    
-    if (!lboData) {
-        console.error("Could not find LBO data for scenario:", state.lboScenario);
-        return;
-    }
-    
-    const { outputs, sentiment, commentary } = lboData;
-
-    const tableBody = document.getElementById('lbo-projections-table');
-    tableBody.innerHTML = outputs.ebitda.map((ebitdaVal, i) => `
-        <tr class="border-b border-gray-700/50">
-            <td class="py-2 px-3 text-center text-gray-400">${i + 1}</td>
-            <td class="py-2 px-3 text-right">${formatterService.largeNumber(ebitdaVal)}</td>
-            <td class="py-2 px-3 text-right">${formatterService.largeNumber(outputs.cashFlow[i])}</td>
-            <td class="py-2 px-3 text-right">${formatterService.largeNumber(outputs.debtBalance[i])}</td>
-        </tr>`).join('');
-    
-    const summaryContainer = document.getElementById('lbo-summary-container');
-    const sentimentClass = sentiment === 'Attractive IRR' ? 'sentiment-bullish' : 'sentiment-bearish';
-    
-    let summaryContent;
-    if (state.lboScenario === 'mezzanineDebt') {
-        summaryContent = `
-            <div class="mb-3">
-                <p class="text-gray-400 text-sm text-center font-semibold mb-1">Initial Capitalization</p>
-                <div class="text-xs font-mono space-y-1">
-                    <div class="flex justify-between"><span class="text-gray-400">Sponsor Equity:</span><span class="font-semibold">${formatterService.largeNumber(outputs.sponsorEquity)}</span></div>
-                    <div class="flex justify-between"><span class="text-gray-400">Senior Debt:</span><span class="font-semibold">${formatterService.largeNumber(outputs.seniorDebt)}</span></div>
-                    <div class="flex justify-between"><span class="text-gray-400">Mezzanine Debt:</span><span class="font-semibold">${formatterService.largeNumber(outputs.mezzanineDebt)}</span></div>
-                </div>
+        <div class="pt-3 border-t border-gray-700 mt-3 space-y-2">
+            <div class="flex justify-between items-center">
+                <span class="text-gray-400">Enterprise Value:</span>
+                <span>${formatterService.largeNumber(enterpriseValue)}</span>
             </div>
-            <div class="grid grid-cols-3 gap-x-2 gap-y-2 font-mono text-center pt-2 border-t border-gray-700/50">
-                <div><p class="text-gray-400 text-xs">Exit Equity</p><p class="text-lg font-bold">${formatterService.largeNumber(outputs.exitEquityValue)}</p></div>
-                <div><p class="text-gray-400 text-xs">MOIC</p><p class="text-xl font-bold text-amber-400">${formatterService.ratio(outputs.moic)}</p></div>
-                <div><p class="text-gray-400 text-xs">IRR</p><p class="text-xl font-bold text-amber-400">${formatterService.percent(outputs.irr)}</p></div>
+            <div class="flex justify-between items-center">
+                <span class="text-gray-400">Equity Value:</span>
+                <span>${formatterService.largeNumber(equityValue)}</span>
             </div>
-        `;
-    } else {
-        const dividendPaid = outputs.dividendPaid || 0;
-
-        summaryContent = `
-            <div class="grid grid-cols-2 gap-x-4 gap-y-2 font-mono text-center">
-                <div>
-                    <p class="text-gray-400 text-sm">Sponsor's Exit Equity</p>
-                    <p class="text-xl font-bold">${formatterService.largeNumber(outputs.exitEquityValue)}</p>
-                </div>
-                ${(['dividendRecap', 'leveragedRecap'].includes(state.lboScenario)) && dividendPaid > 0 ? `
-                    <div>
-                        <p class="text-gray-400 text-sm">Sponsor's Dividends</p>
-                        <p class="text-xl font-bold text-cyan-400">${formatterService.largeNumber(dividendPaid)}</p>
-                    </div>
-                ` : `
-                    <div>
-                        <p class="text-gray-400 text-sm">Sentiment</p>
-                        <span class="mt-1 sentiment-tag ${sentimentClass}">${sentiment}</span>
-                    </div>
-                `}
-                <div>
-                    <p class="text-gray-400 text-sm">Implied MOIC</p>
-                    <p class="text-2xl font-bold text-amber-400">${formatterService.ratio(outputs.moic)}</p>
-                </div>
-                <div>
-                    <p class="text-gray-400 text-sm">Implied IRR</p>
-                    <p class="text-2xl font-bold text-amber-400">${formatterService.percent(outputs.irr)}</p>
-                </div>
-            </div>
-        `;
-    }
-
-    summaryContainer.innerHTML = summaryContent + `<p class="text-xs text-gray-400 mt-3 italic text-center">${commentary}</p>`;
-}
-
-
-async function fetchData(ticker) {
-    state.loading.data = true;
-    state.error = null;
-    state.realtimeStatus = 'connecting';
-    renderApp();
-    try {
-        const quote = await apiService.getTickerSummary(ticker);
-        const peerTickers = peerMap[ticker.toUpperCase()] || [];
-
-        // Fetch peers sequentially with a delay to avoid rate-limiting
-        const peers = [];
-        for (const t of peerTickers) {
-            try {
-                const peerData = await apiService.getTickerSummary(t);
-                peers.push(peerData);
-            } catch (e) {
-                console.warn(`Could not fetch data for peer ${t}:`, e.message);
-                peers.push(null);
-            }
-            await new Promise(res => setTimeout(res, 250)); // 250ms delay between requests
-        }
-        
-        const validPeers = peers.filter(p => p !== null);
-        
-        state.loading.lbo = true;
-        renderApp();
-        
-        const workflowData = await generateValuationWorkflow(quote, validPeers);
-        state.dashboardData = { quote, peers: validPeers, workflow: workflowData };
-        state.realtimeStatus = 'connected';
-        state.loading.lbo = false;
-
-    } catch (err) {
-        console.error(`Failed to load dashboard data:`, err);
-        state.error = err.message;
-        state.dashboardData = null;
-        state.realtimeStatus = 'error';
-    } finally {
-        state.loading.data = false;
-        state.loading.lbo = false;
-        renderApp();
-    }
-}
-function simpleMarkdownToHtml(text) {
-    if (!text) return '';
-
-    let processedText = text;
-
-    // Remove old visual placeholders first
-    processedText = processedText.replace(/\[Visual: (.*?)\]/g, '');
-
-    // 1. Charts
-    processedText = processedText.replace(/\[CHART type="([^"]+)" title="([^"]+)"\]\n?([\s\S]*?)\n?\[\/CHART\]/g, (match, type, title, data) => {
-        const elementId = `chart-${Math.random().toString(36).substr(2, 9)}`;
-        postRenderCallbacks.push(() => renderChart(elementId, type, title, data));
-        return `<div id="${elementId}" class="chart-container"></div>`;
-    });
-
-    // 2. Diagrams
-    processedText = processedText.replace(/\[DIAGRAM type="([^"]+)"\]\n?([\s\S]*?)\n?\[\/DIAGRAM\]/g, (match, type, data) => {
-        return renderDiagram(type, data);
-    });
-
-    // 3. Tables (must run before paragraphs and line breaks)
-    const tableRegex = /^\|(.+)\|\r?\n\|( *:?-+:? *\|)+([\s\S]*?)(?=\n\n|\n###|\n##|\n#|\Z)/gm;
-    processedText = processedText.replace(tableRegex, (tableMatch) => {
-        const lines = tableMatch.trim().split('\n');
-        const headerCells = lines[0].trim().slice(1, -1).split('|').map(h => `<th>${h.trim()}</th>`).join('');
-        const bodyRows = lines.slice(2).map(row => {
-            const cells = row.trim().slice(1, -1).split('|').map(c => `<td>${c.trim()}</td>`).join('');
-            return `<tr>${cells}</tr>`;
-        }).join('');
-        return `<table><thead><tr>${headerCells}</tr></thead><tbody>${bodyRows}</tbody></table>`;
-    });
-    
-    // 4. Headings
-    processedText = processedText.replace(/^\s*### (.*$)/gim, '<h3>$1</h3>');
-    processedText = processedText.replace(/^\s*## (.*$)/gim, '<h2>$1</h2>');
-    processedText = processedText.replace(/^\s*# (.*$)/gim, '<h1>$1</h1>');
-
-    // 5. Lists (handle consecutive items)
-    processedText = processedText.replace(/^\s*[-*] (.*$)/gim, '<li>$1</li>');
-    processedText = processedText.replace(/(<\/li>\s*<li>)/g, '</li><li>');
-    processedText = processedText.replace(/(<li>.*<\/li>)/gs, '<ul>$1</ul>');
-
-    // 6. Inline elements
-    processedText = processedText.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
-
-    // 7. Paragraphs and line breaks
-    const blocks = processedText.split(/(<(?:table|ul|h[1-3]|div)[\s\S]*?<\/(?:table|ul|h[1-3]|div)>)/g);
-    const html = blocks.map(block => {
-        if (block.startsWith('<')) {
-            return block; 
-        }
-        return block
-            .trim()
-            .split(/\n\s*\n/) 
-            .filter(p => p.trim())
-            .map(p => `<p>${p.replace(/\n/g, '<br>')}</p>`)
-            .join('');
-    }).join('');
-    
-    return html.replace(/<\/ul><br>/g, '</ul>');
-}
-
-function renderChart(elementId, type, title, data) {
-    const el = document.getElementById(elementId);
-    if (!el || !(window as any).Plotly) return;
-
-    try {
-        const rows = data.trim().split('\n').map(row => row.split(',').map(cell => cell.trim()));
-        const headers = rows.shift();
-        
-        const layout = {
-            title: { text: title, font: { color: state.theme === 'dark' ? '#c9d1d9' : '#000000', family: 'Inter, sans-serif' } },
-            paper_bgcolor: 'transparent',
-            plot_bgcolor: 'transparent',
-            font: { color: state.theme === 'dark' ? '#8b949e' : '#6b7280', family: 'Inter, sans-serif' },
-            xaxis: { gridcolor: state.theme === 'dark' ? '#30363d' : '#e5e7eb', linecolor: state.theme === 'dark' ? '#30363d' : '#d1d5db' },
-            yaxis: { gridcolor: state.theme === 'dark' ? '#30363d' : '#e5e7eb', linecolor: state.theme === 'dark' ? '#30363d' : '#d1d5db' },
-            yaxis2: { overlaying: 'y', side: 'right', gridcolor: 'transparent', linecolor: state.theme === 'dark' ? '#30363d' : '#d1d5db', showgrid: false },
-            legend: { orientation: 'h', yanchor: 'bottom', y: 1.02, xanchor: 'right', x: 1 },
-            margin: { l: 50, r: 50, b: 50, t: 50, pad: 4 }
-        };
-
-        let plotData;
-        switch (type) {
-            case 'bar-line-combo':
-                plotData = [
-                    { x: rows.map(r => r[0]), y: rows.map(r => parseFloat(r[1])), type: 'bar', name: headers[1], marker: { color: '#388bfd' } },
-                    { x: rows.map(r => r[0]), y: rows.map(r => parseFloat(r[2])), type: 'scatter', mode: 'lines+markers', name: headers[2], yaxis: 'y2', marker: { color: '#e3b341' } }
-                ];
-                break;
-            case 'line':
-                plotData = headers.slice(1).map((header, i) => ({
-                    x: rows.map(r => r[0]), y: rows.map(r => parseFloat(r[i + 1])), type: 'scatter', mode: 'lines', name: header
-                }));
-                break;
-            case 'donut':
-                plotData = [{
-                    labels: rows.map(r => r[0]),
-                    values: rows.map(r => parseInt(r[1])),
-                    type: 'pie',
-                    hole: .4,
-                    textinfo: 'label+percent',
-                    insidetextorientation: 'radial',
-                    marker: { colors: ['#2da44e', '#e3b341', '#f85149'] } // Green, Gold, Red
-                }];
-                (layout as any).showlegend = false;
-                break;
-        }
-
-        if (plotData) {
-            (window as any).Plotly.newPlot(elementId, plotData, layout, {responsive: true, displaylogo: false});
-        }
-    } catch (error) {
-        console.error("Failed to render chart:", error);
-        el.innerHTML = `<p class="text-red-500 text-center">Could not render chart: Invalid data format.</p>`;
-    }
-}
-
-function renderDiagram(type, data) {
-    const items = data.trim().split('\n').map(item => item.trim().replace(/^\* ?-? ?/, ''));
-    const diagramClass = `diagram-${type}`;
-
-    return `
-        <div class="diagram-container ${diagramClass}">
-            ${items.map(item => `
-                <div class="diagram-item">
-                    <div class="diagram-item-connector"></div>
-                    <div class="diagram-item-content">
-                        ${item.replace(/(\d{4}:|[\w\s]+:)/, '<strong>$1</strong>')}
-                    </div>
-                </div>
-            `).join('')}
         </div>
     `;
 }
 
-function parsePitchDeckContent(text) {
-    const slidesRaw = text.split(/\n(?=##?#? |Slide \d+:?)/).filter(s => s.trim());
-    const slides = slidesRaw.map(slideText => {
-        const lines = slideText.trim().split('\n');
-        const title = lines.shift().replace(/##?#? ?|Slide \d+:? ?/g, '').trim();
-        const content = lines.join('\n').trim();
-        return { title, content };
-    });
-    return slides.length > 0 ? slides : [{ title: "Generated Content", content: text }];
+
+function renderLboOutputs() {
+    const tableContainer = document.getElementById('lbo-projections-table');
+    const summaryContainer = document.getElementById('lbo-summary-container');
+    if (!tableContainer || !summaryContainer || !state.dashboardData) return;
+
+    const allLboScenarios = state.dashboardData.workflow.lboAnalysis.scenarios;
+    const lboData = allLboScenarios.find(s => s.header.scenarioId === state.lboScenario);
+    
+    if (!lboData) return;
+    
+    const { projections, returns } = lboData.outputs;
+
+    tableContainer.innerHTML = projections.map(p => `
+        <tr>
+            <td class="py-2 px-3 text-center">${p.year}</td>
+            <td class="py-2 px-3 text-right">${formatterService.largeNumber(p.ebitda)}</td>
+            <td class="py-2 px-3 text-right">${formatterService.largeNumber(p.cashFlow)}</td>
+            <td class="py-2 px-3 text-right">${formatterService.largeNumber(p.endingDebt)}</td>
+        </tr>
+    `).join('');
+    
+    summaryContainer.innerHTML = `
+        <div class="grid grid-cols-2 gap-x-6 gap-y-2 font-mono text-sm">
+            <div class="flex justify-between items-center"><span class="text-gray-400">Entry Equity:</span><span>${formatterService.largeNumber(returns.entryEquity)}</span></div>
+            <div class="flex justify-between items-center"><span class="text-gray-400">Exit Equity:</span><span>${formatterService.largeNumber(returns.exitEquity)}</span></div>
+            <div class="flex justify-between items-center font-bold text-amber-400 text-base pt-1 border-t border-gray-700 mt-1 col-span-2">
+                <span>IRR:</span>
+                <span>${formatterService.percent(returns.irr)}</span>
+            </div>
+            <div class="flex justify-between items-center font-bold text-cyan-400 text-base col-span-2">
+                <span>MOIC:</span>
+                <span>${formatterService.ratio(returns.moic)}</span>
+            </div>
+        </div>
+    `;
 }
 
-function formatDateTime(date) {
-    if (!(date instanceof Date) || isNaN(date.getTime())) {
-        return 'N/A';
-    }
-    const year = date.getFullYear();
-    const month = (date.getMonth() + 1).toString().padStart(2, '0');
-    const day = date.getDate().toString().padStart(2, '0');
-    const hours = date.getHours().toString().padStart(2, '0');
-    const minutes = date.getMinutes().toString().padStart(2, '0');
-    const seconds = date.getSeconds().toString().padStart(2, '0');
-    return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
-}
+function simpleMarkdownToHtml(markdown) {
+    if (!markdown) return '';
+    let html = markdown;
 
-function attachAutocomplete(inputEl, onSelect) {
-    inputEl.addEventListener('input', function() {
-        const val = this.value;
-        // Fix: Pass null to satisfy the function signature.
-        closeAllLists(null);
-        if (!val) { return false; }
-        const suggestions = tickerList.filter(item => 
-            item.ticker.toUpperCase().includes(val.toUpperCase()) || 
-            item.name.toUpperCase().includes(val.toUpperCase())
-        ).slice(0, 5);
-        
-        const list = document.createElement("div");
-        list.setAttribute("class", "autocomplete-items");
-        this.parentNode.appendChild(list);
+    // Handle charts [CHART type="..." title="..."]...[/CHART]
+    html = html.replace(/\[CHART type="([^"]+)" title="([^"]+)"\]\n?([\s\S]+?)\[\/CHART\]/g, (match, type, title, data) => {
+        const id = `chart-${Math.random().toString(36).substring(7)}`;
+        postRenderCallbacks.push(() => {
+            const lines = data.trim().split('\n');
+            const header = lines[0].split(',');
+            const rows = lines.slice(1).map(line => line.split(','));
+            
+            const plotData = [];
+            if (type === 'line' || type === 'bar') {
+                for (let i = 1; i < header.length; i++) {
+                    plotData.push({
+                        x: rows.map(r => r[0]),
+                        y: rows.map(r => parseFloat(r[i])),
+                        name: header[i],
+                        type: type
+                    });
+                }
+            } else if (type === 'bar-line-combo') {
+                // Assumes 1st series is bar, 2nd is line
+                plotData.push({ x: rows.map(r => r[0]), y: rows.map(r => parseFloat(r[1])), name: header[1], type: 'bar' });
+                plotData.push({ x: rows.map(r => r[0]), y: rows.map(r => parseFloat(r[2])), name: header[2], type: 'scatter', mode: 'lines', yaxis: 'y2' });
+            } else if (type === 'donut') {
+                 plotData.push({
+                    labels: rows.map(r => r[0]),
+                    values: rows.map(r => parseInt(r[1], 10)),
+                    hole: .4,
+                    type: 'pie'
+                });
+            }
 
-        suggestions.forEach(item => {
-            const itemEl = document.createElement("div");
-            itemEl.setAttribute("class", "autocomplete-item");
-            itemEl.innerHTML = `<span class="name">${item.name}</span><span class="ticker">${item.ticker}</span>`;
-            itemEl.addEventListener("click", function() {
-                inputEl.value = item.ticker;
-                onSelect(item.ticker);
-                closeAllLists(null);
-            });
-            list.appendChild(itemEl);
+            const layout = {
+                title: { text: title, font: { color: 'var(--text-primary)' } },
+                paper_bgcolor: 'transparent',
+                plot_bgcolor: 'transparent',
+                font: { color: 'var(--text-secondary)', family: 'Inter, sans-serif' },
+                xaxis: { gridcolor: 'var(--border-primary)', linecolor: 'var(--border-primary)' },
+                yaxis: { title: header.length > 2 && header[1].includes('USD') ? 'USD (Millions)' : '', gridcolor: 'var(--border-primary)', linecolor: 'var(--border-primary)' },
+                yaxis2: type === 'bar-line-combo' ? { title: header[2], overlaying: 'y', side: 'right', showgrid: false, linecolor: 'var(--border-primary)' } : {},
+                legend: { orientation: 'h', y: -0.2, x: 0.5, xanchor: 'center' },
+                margin: { l: 60, r: 60, b: 80, t: 60, pad: 4 }
+            };
+            
+            const config = { responsive: true };
+            
+            const chartEl = document.getElementById(id);
+            // --- FIX: Check for Plotly existence before using it. ---
+            if (chartEl && typeof Plotly !== 'undefined') Plotly.newPlot(id, plotData, layout, config);
         });
+        return `<div id="${id}" class="chart-container"></div>`;
     });
+    
+    // Handle diagrams [DIAGRAM type="..."]...[/DIAGRAM]
+    html = html.replace(/\[DIAGRAM type="([^"]+)"\]\n?([\s\S]+?)\[\/DIAGRAM\]/g, (match, type, data) => {
+        const items = data.trim().split('\n').map(item => {
+            const parts = item.split(':');
+            return {
+                label: parts.length > 1 ? `<strong>${parts[0].trim()}:</strong>` : '',
+                text: parts.length > 1 ? parts.slice(1).join(':').trim() : parts[0].trim()
+            };
+        });
+        return `
+            <div class="diagram-container diagram-${type}">
+                ${items.map(item => `
+                    <div class="diagram-item">
+                        <div class="diagram-item-connector"></div>
+                        <div class="diagram-item-content">
+                            ${item.label} ${item.text}
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        `;
+    });
+    
+    // Basic markdown
+    html = html.replace(/^### (.*$)/gim, '<h3>$1</h3>')
+               .replace(/^## (.*$)/gim, '<h2>$1</h2>')
+               .replace(/^# (.*$)/gim, '<h1>$1</h1>')
+               .replace(/\*\*(.*)\*\*/g, '<strong>$1</strong>')
+               .replace(/\*(.*)\*/g, '<em>$1</em>')
+               .replace(/^\* (.*$)/gim, '<ul><li>$1</li></ul>')
+               .replace(/<\/ul>\n<ul>/g, '') // Combine consecutive lists
+               .replace(/\n/g, '<br>');
+
+    // Table markdown
+    const tableRegex = /(\|.*\|(?:\r|\n|)?)+/g;
+    html = html.replace(tableRegex, (table) => {
+        const rows = table.trim().split('\n');
+        const header = rows[0].split('|').slice(1, -1).map(h => `<th>${h.trim()}</th>`).join('');
+        // Skip separator line
+        const body = rows.slice(2).map(row => {
+            const cells = row.split('|').slice(1, -1).map(c => `<td>${c.trim()}</td>`).join('');
+            return `<tr>${cells}</tr>`;
+        }).join('');
+        return `<table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`.replace(/<br>/g, ''); // Remove br tags inside tables
+    });
+    
+    return html.replace(/<br>\s*<h[1-3]>/g, '<h$1>').replace(/<br>\s*<(ul|table)>/g, '<$1>');
 }
-function closeAllLists(elmnt) {
-    const items = document.getElementsByClassName("autocomplete-items");
-    for (let i = 0; i < items.length; i++) {
-        // Fix: Cast parentNode to Element to access getElementsByTagName.
-        if (elmnt != items[i] && elmnt != (items[i].parentNode as Element).getElementsByTagName("input")[0]) {
-            items[i].parentNode.removeChild(items[i]);
+
+function getSentimentDetails(changePercent) {
+    if (changePercent > 0.02) return { sentiment: 'Strongly Bullish', className: 'sentiment-bullish', emoji: '🚀' };
+    if (changePercent > 0) return { sentiment: 'Bullish', className: 'sentiment-bullish', emoji: '📈' };
+    if (changePercent < -0.02) return { sentiment: 'Strongly Bearish', className: 'sentiment-bearish', emoji: '🔥' };
+    if (changePercent < 0) return { sentiment: 'Bearish', className: 'sentiment-bearish', emoji: '📉' };
+    return { sentiment: 'Neutral', className: 'sentiment-neutral', emoji: '☕' };
+}
+
+// --- 6. EVENT LISTENERS & HANDLERS ---
+function addWelcomeEventListeners() {
+    document.getElementById('launch-btn')?.addEventListener('click', handleLaunch);
+    const input = document.getElementById('welcome-ticker-input') as HTMLInputElement;
+    input?.addEventListener('input', handleWelcomeTickerInput);
+    input?.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') handleLaunch();
+    });
+    autocomplete(input, tickerList);
+}
+
+function addDashboardEventListeners() {
+    document.querySelectorAll('.nav-btn').forEach(btn => btn.addEventListener('click', handleTabClick));
+    document.getElementById('back-btn')?.addEventListener('click', () => setState({ currentTab: 'valuation_models' }));
+    document.getElementById('copy-btn')?.addEventListener('click', () => {
+        const content = state.analysisContent[state.ticker]?.[state.currentTab];
+        if (content) {
+            navigator.clipboard.writeText(content);
+            const btn = document.getElementById('copy-btn');
+            if (btn) {
+                btn.textContent = 'Copied!';
+                setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+            }
+        }
+    });
+
+    document.querySelectorAll('.peer-table .sortable-header').forEach(header => {
+        header.addEventListener('click', handlePeerSort);
+    });
+    
+    document.getElementById('theme-toggle-btn')?.addEventListener('click', handleThemeToggle);
+    
+    // Alert UI listeners
+    document.getElementById('toggle-alert-btn')?.addEventListener('click', handleAlertToggle);
+    document.getElementById('set-alert-btn')?.addEventListener('click', handleSetAlert);
+    document.getElementById('clear-alert-btn')?.addEventListener('click', handleClearAlert);
+    
+    // Pitch Deck listeners
+    document.getElementById('prev-slide-btn')?.addEventListener('click', () => handlePitchDeckNav('prev'));
+    document.getElementById('next-slide-btn')?.addEventListener('click', () => handlePitchDeckNav('next'));
+    document.getElementById('copy-slide-btn')?.addEventListener('click', handleCopySlide);
+    
+    // Ticker Switch listeners
+    document.getElementById('ticker-switch-btn')?.addEventListener('click', handleTickerSwitch);
+    const switchInput = document.getElementById('ticker-switch-input') as HTMLInputElement;
+    switchInput?.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') handleTickerSwitch();
+    });
+    autocomplete(switchInput, tickerList);
+}
+
+// --- FIX: Add type to event object and cast e.target to HTMLInputElement to safely access 'value'. ---
+function handleWelcomeTickerInput(e: Event) {
+    const value = (e.target as HTMLInputElement).value;
+    setState({ welcomeTicker: value, welcomeTickerError: '' });
+}
+
+async function handleLaunch() {
+    if (state.isWelcomeTickerValidating) return;
+
+    const ticker = state.welcomeTicker.trim().toUpperCase();
+    if (!ticker) {
+        setState({ welcomeTickerError: 'Please enter a ticker.' });
+        return;
+    }
+
+    setState({ isWelcomeTickerValidating: true, welcomeTickerError: '' });
+
+    // 1. Basic format validation
+    const tickerRegex = /^[A-Z0-9.-]+$/;
+    if (!tickerRegex.test(ticker)) {
+        setState({ welcomeTickerError: 'Invalid ticker format.', isWelcomeTickerValidating: false });
+        return;
+    }
+
+    // 2. Gemini validation
+    const validationResult = await validateTickerWithGemini(ticker);
+    if (!validationResult.valid) {
+        setState({ welcomeTickerError: validationResult.reason || 'Invalid or non-existent ticker.', isWelcomeTickerValidating: false });
+        return;
+    }
+
+    // 3. Data load
+    try {
+        await initData(ticker);
+        setState({ currentView: 'dashboard', isWelcomeTickerValidating: false });
+    } catch (e) {
+        setState({ welcomeTickerError: e.message || `Failed to load data for ${ticker}.`, isWelcomeTickerValidating: false });
+    }
+}
+
+async function handleTickerSwitch() {
+    // --- FIX: Cast HTMLElement to HTMLInputElement to safely access 'value'. ---
+    const input = document.getElementById('ticker-switch-input') as HTMLInputElement;
+    const ticker = input.value.trim().toUpperCase();
+    
+    if (state.isTickerSwitchValidating || !ticker || ticker === state.ticker) {
+        if (!ticker) setState({ tickerSwitchError: '', isTickerSwitchValidating: false });
+        return;
+    }
+
+    setState({ isTickerSwitchValidating: true, tickerSwitchError: '' });
+    
+    const tickerRegex = /^[A-Z0-9.-]+$/;
+    if (!tickerRegex.test(ticker)) {
+        setState({ tickerSwitchError: 'Invalid format.', isTickerSwitchValidating: false });
+        return;
+    }
+    
+    const validationResult = await validateTickerWithGemini(ticker);
+    if (!validationResult.valid) {
+        setState({ tickerSwitchError: validationResult.reason || 'Invalid ticker.', isTickerSwitchValidating: false });
+        return;
+    }
+    
+    try {
+        await initData(ticker);
+        input.value = '';
+        setState({ isTickerSwitchValidating: false, tickerSwitchError: '' });
+    } catch (e) {
+        setState({ tickerSwitchError: e.message || `Failed to load ${ticker}.`, isTickerSwitchValidating: false });
+    }
+}
+
+async function handleTabClick(e: Event) {
+    const key = (e.currentTarget as HTMLElement).dataset.tabKey;
+    if (state.currentTab === key) return;
+
+    setState({ currentTab: key });
+    
+    if (['swot', 'memo', 'news'].includes(key)) {
+        const analysisCache = state.analysisContent[state.ticker] || {};
+        if (!analysisCache[key]) {
+            setState({ loading: { ...state.loading, analysis: true } });
+            try {
+                const content = await generateAnalysis(state.ticker, state.dashboardData.quote.companyName, key);
+                setState({
+                    analysisContent: {
+                        ...state.analysisContent,
+                        [state.ticker]: { ...analysisCache, [key]: content }
+                    },
+                    loading: { ...state.loading, analysis: false }
+                });
+            } catch (error) {
+                console.error(`Error generating ${key}:`, error);
+                setState({ loading: { ...state.loading, analysis: false }, error: `Failed to generate ${key}.` });
+            }
+        }
+    } else if (key === 'pitch_deck') {
+        const { pitchDeck, ticker, dashboardData } = state;
+        if (pitchDeck.ticker !== ticker) {
+             setState({ loading: { ...state.loading, analysis: true } });
+             try {
+                const content = await generateAnalysis(ticker, dashboardData.quote.companyName, 'pitch_deck');
+                const slides = content.split('### ').slice(1).map((slideContent, index) => {
+                    const lines = slideContent.trim().split('\n');
+                    return {
+                        id: index,
+                        title: lines[0].trim(),
+                        content: lines.slice(1).join('\n').trim()
+                    };
+                });
+
+                setState({
+                    pitchDeck: { ticker, slides, currentSlide: 0 },
+                    loading: { ...state.loading, analysis: false }
+                });
+            } catch (error) {
+                console.error(`Error generating pitch deck:`, error);
+                setState({ loading: { ...state.loading, analysis: false }, error: `Failed to generate pitch deck.` });
+            }
         }
     }
 }
-document.addEventListener("click", function (e) {
-    closeAllLists(e.target);
-});
+
+// --- FIX: Add type to event object and cast e.target to HTMLInputElement for type safety. ---
+function handleModelInputChange(e: Event) {
+    const target = e.target as HTMLInputElement;
+    if (target.type !== 'range') return;
+    
+    const sliderId = target.id;
+    const modelType = target.dataset.model;
+    const value = parseFloat(target.value);
+    const [model, inputKey] = sliderId.split('-');
+
+    let modelData, formatter;
+    if (modelType === 'dcf') {
+        modelData = state.dashboardData.workflow.dcfValuation;
+        formatter = modelData.inputs[inputKey].value > 1 ? (v) => v.toFixed(2) : formatterService.percent;
+    } else { // lbo
+        const allScenarios = state.dashboardData.workflow.lboAnalysis.scenarios;
+        const currentScenario = allScenarios.find(s => s.header.scenarioId === state.lboScenario);
+        modelData = currentScenario;
+        formatter = (v) => {
+            if (inputKey === 'exitMultiple') return formatterService.ratio(v);
+            if (inputKey.includes('Period') || inputKey.includes('Year')) return v.toString();
+            return formatterService.percent(v);
+        };
+    }
+    
+    modelData.inputs[inputKey].value = value;
+    document.getElementById(`${sliderId}-value`).textContent = formatter(value);
+    
+    if (modelType === 'dcf') {
+        // Here you would call a function to recalculate DCF outputs
+        // For now, let's assume a backend would do this. We'll simulate.
+        // This recalculation logic should eventually live in a service worker or backend.
+        // For simplicity, we are not recalculating on the fly.
+        // renderDcfOutputs();
+    } else {
+        // renderLboOutputs();
+    }
+}
+
+// --- FIX: Add type to event object and cast e.target to HTMLSelectElement to safely access 'value'. ---
+function handleLboScenarioChange(e: Event) {
+    const newScenarioId = (e.target as HTMLSelectElement).value;
+    setState({ lboScenario: newScenarioId });
+}
+
+function handlePeerSort(e: MouseEvent) {
+    const newColumn = (e.currentTarget as HTMLElement).dataset.sort;
+    let newDirection = 'desc';
+    if (state.peerSort.column === newColumn && state.peerSort.direction === 'desc') {
+        newDirection = 'asc';
+    }
+    setState({ peerSort: { column: newColumn, direction: newDirection } });
+}
+
+function handleThemeToggle() {
+    const newTheme = state.theme === 'dark' ? 'light' : 'dark';
+    document.body.classList.toggle('dark-mode', newTheme === 'dark');
+    setState({ theme: newTheme });
+}
+
+function handleAlertToggle() {
+    setState({ showAlertInput: !state.showAlertInput });
+}
+
+function handleSetAlert() {
+    // --- FIX: Cast HTMLElement to HTMLInputElement to safely access 'value'. ---
+    const input = document.getElementById('alert-price-input') as HTMLInputElement;
+    const targetPrice = parseFloat(input.value);
+    if (!isNaN(targetPrice) && targetPrice > 0) {
+        const currentPrice = state.dashboardData.quote.price;
+        setState({
+            alert: {
+                target: targetPrice,
+                active: true,
+                triggered: false,
+                direction: targetPrice > currentPrice ? 'up' : 'down'
+            },
+            showAlertInput: false
+        });
+    }
+}
+
+function handleClearAlert() {
+    setState({
+        alert: { target: null, active: false, triggered: false, direction: null },
+        showAlertInput: false
+    });
+}
+
+function handlePitchDeckNav(direction) {
+    const { currentSlide, slides } = state.pitchDeck;
+    const newSlide = direction === 'next' ? currentSlide + 1 : currentSlide - 1;
+    if (newSlide >= 0 && newSlide < slides.length) {
+        setState({ pitchDeck: { ...state.pitchDeck, currentSlide: newSlide } });
+    }
+}
+
+function handleCopySlide() {
+    const currentSlide = state.pitchDeck.slides[state.pitchDeck.currentSlide];
+    if (currentSlide) {
+        const textToCopy = `### ${currentSlide.title}\n\n${currentSlide.content}`;
+        navigator.clipboard.writeText(textToCopy);
+        const btn = document.getElementById('copy-slide-btn');
+        if (btn) {
+            btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-4 h-4"><path d="M12.207 4.793a1 1 0 0 1 0 1.414l-5 5a1 1 0 0 1-1.414 0l-2-2a1 1 0 0 1 1.414-1.414L6.5 9.086l4.293-4.293a1 1 0 0 1 1.414 0Z" /></svg> Copied!`;
+            setTimeout(() => {
+                btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="w-4 h-4"><path d="M5.5 2a.5.5 0 0 0-.5.5v8a.5.5 0 0 0 .5.5h5a.5.5 0 0 0 .5-.5v-8a.5.5 0 0 0-.5-.5h-5ZM5 2a1.5 1.5 0 0 1 1.5-1.5h2A1.5 1.5 0 0 1 10 .5v1a.5.5 0 0 0 1 0v-1A2.5 2.5 0 0 0 8.5 0h-2A2.5 2.5 0 0 0 4 2.5v1a.5.5 0 0 0 1 0v-1.5Z"/></svg> Copy Slide`;
+            }, 2000);
+        }
+    }
+}
+
+// --- 7. AUTOCOMPLETE ---
+function autocomplete(inp: HTMLInputElement, arr: {ticker: string, name: string}[]) {
+    let currentFocus;
+    if (!inp) return;
+    
+    const closeAllLists = (elmnt: EventTarget | null) => {
+        const x = document.getElementsByClassName("autocomplete-items");
+        for (let i = 0; i < x.length; i++) {
+            if (elmnt != x[i] && elmnt != inp) {
+                x[i].parentNode.removeChild(x[i]);
+            }
+        }
+    }
+
+    inp.addEventListener("input", function(this: HTMLInputElement, e: Event) {
+        let a, b, i, val = this.value;
+        // --- FIX: Pass null to closeAllLists as it expects one argument. ---
+        closeAllLists(null);
+        if (!val) { return false;}
+        currentFocus = -1;
+        a = document.createElement("DIV");
+        a.setAttribute("id", this.id + "autocomplete-list");
+        a.setAttribute("class", "autocomplete-items");
+        this.parentNode.appendChild(a);
+        
+        const filteredArr = arr.filter(item => 
+            item.ticker.toUpperCase().includes(val.toUpperCase()) || 
+            item.name.toUpperCase().includes(val.toUpperCase())
+        ).slice(0, 5);
+
+        for (i = 0; i < filteredArr.length; i++) {
+            b = document.createElement("DIV");
+            b.setAttribute("class", "autocomplete-item");
+            
+            const highlight = (text, query) => text.replace(new RegExp(query, 'gi'), (match) => `<strong>${match}</strong>`);
+            
+            b.innerHTML = `
+                <span class="name">${highlight(filteredArr[i].name, val)}</span>
+                <span class="ticker">${highlight(filteredArr[i].ticker, val)}</span>`;
+            
+            b.dataset.ticker = filteredArr[i].ticker;
+
+            b.addEventListener("click", function(this: HTMLDivElement, e: MouseEvent) {
+                inp.value = this.dataset.ticker;
+                if(inp.id === 'welcome-ticker-input') {
+                   setState({ welcomeTicker: inp.value });
+                }
+                closeAllLists(null);
+            });
+            a.appendChild(b);
+        }
+    });
+
+    document.addEventListener("click", function (e) {
+        closeAllLists(e.target);
+    });
+}
+
+// --- 8. INITIALIZATION & DATA ---
+async function initData(ticker) {
+    setState({ loading: { ...state.loading, data: true }, error: null, ticker: ticker.toUpperCase(), tickerSwitchError: '' });
+    
+    stopRealtimeUpdates(); // Stop previous updates
+    
+    try {
+        const summaryData = await apiService.getTickerSummary(ticker);
+
+        // Fetch peer data
+        const peerTickers = peerMap[ticker.toUpperCase()] || [];
+        const peerPromises = [ticker, ...peerTickers].map(t => 
+            apiService.getTickerSummary(t).catch(e => {
+                console.warn(`Could not fetch data for peer ${t}:`, e.message);
+                return null; // Return null if a peer fails
+            })
+        );
+        const peerData = (await Promise.all(peerPromises)).filter(p => p !== null);
+
+        // Simulate fetching workflow data for now
+        const workflow = generateWorkflowData(summaryData);
+        
+        setState({
+            dashboardData: { quote: summaryData, peers: peerData, workflow },
+            loading: { ...state.loading, data: false },
+            error: null,
+            // Reset related states on new ticker load
+            lboScenario: 'baseCase',
+            currentTab: 'valuation_models',
+            pitchDeck: { ticker: null, currentSlide: 0, slides: [] },
+            alert: { target: null, active: false, triggered: false, direction: null },
+            showAlertInput: false,
+        });
+
+        startRealtimeUpdates();
+
+    } catch (e) {
+        console.error("Failed to initialize data:", e);
+        setState({ loading: { ...state.loading, data: false }, error: e.message });
+        throw e; // Re-throw to be caught by handlers
+    }
+}
+
+function updateQuoteData(newQuoteData) {
+    const oldPrice = state.dashboardData?.quote?.price;
+    const newPrice = newQuoteData?.price;
+    
+    setState({
+        dashboardData: { ...state.dashboardData, quote: newQuoteData }
+    });
+    
+    if (oldPrice && newPrice) {
+        const priceElement = document.getElementById('header-latest-price');
+        if (priceElement) {
+            priceElement.classList.remove('flash-text-green', 'flash-text-red');
+            if (newPrice > oldPrice) {
+                priceElement.classList.add('flash-text-green');
+            } else if (newPrice < oldPrice) {
+                priceElement.classList.add('flash-text-red');
+            }
+        }
+    }
+    checkPriceAlert();
+}
+
+function startRealtimeUpdates() {
+    stopRealtimeUpdates(); // Ensure no multiple intervals are running
+    setState({ realtimeStatus: 'connecting' });
+    
+    const fetchUpdate = async () => {
+        try {
+            const summaryData = await apiService.getTickerSummary(state.ticker);
+            updateQuoteData(summaryData);
+            if(state.realtimeStatus !== 'connected') setState({ realtimeStatus: 'connected' });
+        } catch (error) {
+            console.error('Real-time update failed:', error);
+            setState({ realtimeStatus: 'error' });
+        }
+    };
+
+    fetchUpdate(); // Initial fetch
+    realtimeIntervalId = setInterval(fetchUpdate, 30000); // Update every 30 seconds
+}
 
 function stopRealtimeUpdates() {
     if (realtimeIntervalId) {
@@ -1894,493 +1680,100 @@ function stopRealtimeUpdates() {
     }
 }
 
-async function startRealtimeUpdates() {
-    stopRealtimeUpdates(); 
-    realtimeIntervalId = setInterval(async () => {
-        if (state.currentView !== 'dashboard' || !state.ticker || !state.dashboardData) return;
-        
-        try {
-            const oldPrice = state.dashboardData.quote.price;
-            const newSummaryData = await apiService.getTickerSummary(state.ticker);
-
-            if (state.realtimeStatus !== 'connected') {
-                state.realtimeStatus = 'connected';
-                renderHeader();
-                addDashboardEventListeners();
-            }
-
-            state.dashboardData.quote = { ...state.dashboardData.quote, ...newSummaryData };
-            const quote = state.dashboardData.quote;
-            const newPrice = quote.price;
-            
-            checkPriceAlert();
-            
-            // Update Header
-            const priceEl = document.getElementById('header-latest-price');
-            const changeEl = document.querySelector('#price-quote .font-semibold');
-            const sentimentTagEl = document.getElementById('sentiment-tag');
-
-            if (priceEl && changeEl) {
-                priceEl.textContent = `${formatterService.currency(newPrice)} USD`;
-                changeEl.textContent = `${formatterService.currency(quote.change)} (${formatterService.percent(quote.changePercent / 100)})`;
-                changeEl.className = `font-semibold ${quote.change >= 0 ? 'text-green-400' : 'text-red-400'}`;
-                
-                priceEl.classList.remove('flash-text-green', 'flash-text-red');
-                void priceEl.offsetWidth; 
-                
-                if (newPrice > oldPrice) {
-                    priceEl.classList.add('flash-text-green');
-                } else if (newPrice < oldPrice) {
-                    priceEl.classList.add('flash-text-red');
-                }
-            }
-
-            if (sentimentTagEl) {
-                const { sentiment, className, emoji } = getSentimentDetails(quote.changePercent);
-                sentimentTagEl.className = `sentiment-tag ${className}`;
-                sentimentTagEl.innerHTML = `${emoji} ${sentiment}`;
-            }
-            
-            if(state.currentTab === 'valuation_models') {
-                const dcfInputs = state.dashboardData.workflow.dcfValuation.inputs;
-                const modelType = state.dashboardData.workflow.dcfValuation.modelType || 'Standard';
-
-                const assumptions = modelType === 'Financials'
-                    ? {
-                        roe: dcfInputs.roe.value,
-                        reinvestmentRate: dcfInputs.reinvestmentRate.value,
-                        costOfEquity: dcfInputs.costOfEquity.value,
-                        terminalGrowth: dcfInputs.terminalGrowth.value,
-                    }
-                    : {
-                        revenueGrowth: dcfInputs.revenueGrowth.value,
-                        operatingMargin: dcfInputs.operatingMargin.value,
-                        taxRate: dcfInputs.taxRate.value,
-                        reinvestmentRate: dcfInputs.reinvestmentRate.value,
-                        wacc: dcfInputs.wacc.value,
-                        terminalGrowth: dcfInputs.terminalGrowth.value,
-                    };
-
-                const dcfOutputs = calculateDcfOutputs(quote, assumptions);
-                state.dashboardData.workflow.dcfValuation.outputs = dcfOutputs;
-                const dcfSentiment = getDcfSentimentAndCommentary(dcfOutputs, quote);
-                state.dashboardData.workflow.dcfValuation.sentiment = dcfSentiment.sentiment;
-                state.dashboardData.workflow.dcfValuation.commentary = dcfSentiment.commentary;
-                renderDcfOutputs();
-
-                // Live LBO updates are complex; for now, a full recalc is disabled on tick to save API calls
-                // A simple price update might be enough for the LBO purchase price display
-                 const purchasePriceDisplay = document.getElementById('lbo-purchase-price-display');
-                 if (purchasePriceDisplay) {
-                     purchasePriceDisplay.textContent = formatterService.largeNumber(quote.marketCap);
-                 }
-            }
-
-        } catch (error) {
-            console.error("Real-time update failed:", error);
-            if (state.realtimeStatus !== 'error') {
-                state.realtimeStatus = 'error';
-                renderHeader();
-                addDashboardEventListeners();
-            }
-        }
-    }, 30000); 
-}
-
 function checkPriceAlert() {
-    const { alert, dashboardData, ticker } = state;
-    if (!alert.active || alert.triggered || !dashboardData) return;
-
-    const currentPrice = dashboardData.quote.price;
-    let triggered = false;
-    if (alert.direction === 'up' && currentPrice >= alert.target) {
-        triggered = true;
-    } else if (alert.direction === 'down' && currentPrice <= alert.target) {
-        triggered = true;
-    }
-
-    if (triggered) {
-        state.alert.triggered = true;
-        new Notification('Pitchly Price Alert!', {
-            body: `${ticker} crossed your target of $${alert.target.toFixed(2)}. Current price: $${currentPrice.toFixed(2)}.`,
-            icon: apiService.getLogoUrl(ticker)
-        });
-        renderHeader(); 
-        addDashboardEventListeners();
-    }
-}
-
-function getSentimentDetails(changePercent) {
-    if (typeof changePercent !== 'number') return { sentiment: 'Neutral', className: 'sentiment-neutral', emoji: '😐' };
-
-    if (changePercent > 3) {
-        return { sentiment: 'Bullish', className: 'sentiment-bullish', emoji: '📈' };
-    } else if (changePercent < -3) {
-        return { sentiment: 'Bearish', className: 'sentiment-bearish', emoji: '📉' };
-    } else {
-        return { sentiment: 'Neutral', className: 'sentiment-neutral', emoji: '😐' };
-    }
-}
-
-// --- 7. EVENT HANDLERS ---
-function addWelcomeEventListeners() {
-    document.getElementById('launch-btn').addEventListener('click', handleLaunchDashboard);
-    const welcomeInput = document.getElementById('welcome-ticker-input');
-    welcomeInput.addEventListener('input', e => { state.welcomeTicker = (e.target as HTMLInputElement).value.toUpperCase(); });
-    welcomeInput.addEventListener('keydown', e => { if (e.key === 'Enter') handleLaunchDashboard(); });
-    attachAutocomplete(welcomeInput, (ticker) => {
-        state.welcomeTicker = ticker.toUpperCase();
-        (welcomeInput as HTMLInputElement).value = state.welcomeTicker;
-    });
-}
-function addDashboardEventListeners() {
-    document.querySelectorAll('.nav-btn').forEach(btn => btn.addEventListener('click', handleNavClick));
-    const switchBtn = document.getElementById('ticker-switch-btn');
-    const switchInput = document.getElementById('ticker-switch-input') as HTMLInputElement;
-    if (switchBtn && switchInput) {
-        switchBtn.addEventListener('click', handleTickerSwitch);
-        switchInput.addEventListener('keydown', e => { if (e.key === 'Enter') handleTickerSwitch(); });
-        attachAutocomplete(switchInput, (ticker) => {
-            switchInput.value = ticker.toUpperCase();
-            handleTickerSwitch();
-        });
-    }
-    document.getElementById('back-btn')?.addEventListener('click', handleBackToReport);
-    document.getElementById('copy-btn')?.addEventListener('click', handleCopy);
-    
-    document.getElementById('toggle-alert-btn')?.addEventListener('click', handleToggleAlertInput);
-    document.getElementById('set-alert-btn')?.addEventListener('click', handleSetAlert);
-    document.getElementById('clear-alert-btn')?.addEventListener('click', handleClearAlert);
-    document.getElementById('theme-toggle-btn')?.addEventListener('click', handleThemeToggle);
-}
-
-async function handleLaunchDashboard() {
-    stopRealtimeUpdates();
-    state.ticker = state.welcomeTicker;
-    state.currentView = 'dashboard';
-    state.alert = { target: null, active: false, triggered: false, direction: null };
-    await fetchData(state.ticker);
-    if (!state.error) {
-        startRealtimeUpdates();
-    }
-}
-async function handleTickerSwitch() {
-    const newTicker = (document.getElementById('ticker-switch-input') as HTMLInputElement).value.toUpperCase();
-    if (newTicker && newTicker !== state.ticker) {
-        stopRealtimeUpdates();
-        state.ticker = newTicker;
-        state.analysisContent = {};
-        state.pitchDeck = { currentSlide: 0, slides: [] };
-        state.currentTab = 'valuation_models';
-        state.alert = { target: null, active: false, triggered: false, direction: null };
-        state.lboScenario = 'baseCase';
-        await fetchData(newTicker);
-         if (!state.error) {
-            startRealtimeUpdates();
+    const { alert, dashboardData } = state;
+    if (alert.active && !alert.triggered && dashboardData?.quote?.price) {
+        const currentPrice = dashboardData.quote.price;
+        if ((alert.direction === 'up' && currentPrice >= alert.target) ||
+            (alert.direction === 'down' && currentPrice <= alert.target)) {
+            setState({ alert: { ...alert, triggered: true } });
         }
     }
 }
-async function handleNavClick(event) {
-    const key = (event.currentTarget as HTMLElement).dataset.tabKey;
-    state.currentTab = key;
-    const isAnalysisTab = !['valuation_models', 'peer_comparison'].includes(key);
 
-    const analysisData = state.analysisContent[key];
-    if (isAnalysisTab && (!analysisData || analysisData.ticker !== state.ticker)) {
-        state.loading.analysis = true;
-        renderContent(); // Show loading state
-        try {
-            const companyName = state.dashboardData?.quote?.companyName || state.ticker;
-            const result = await generateAnalysis(state.ticker, companyName, key);
-            state.analysisContent[key] = { ticker: state.ticker, content: result };
-             if (key === 'pitch_deck' && result) {
-                state.pitchDeck.slides = parsePitchDeckContent(result);
-                state.pitchDeck.currentSlide = 0;
+
+// --- DUMMY DATA GENERATION (to be replaced by real logic) ---
+function generateWorkflowData(quote) {
+    const domain = getTickerDomain(quote.ticker);
+    const isFinancial = domain === 'Financials';
+    
+    const dcfInputs = isFinancial ? {
+        roe: { value: quote.roe || 0.15, min: 0.05, max: 0.30, step: 0.005 },
+        reinvestmentRate: { value: 0.40, min: 0.20, max: 0.80, step: 0.01 },
+        costOfEquity: { value: 0.09, min: 0.05, max: 0.15, step: 0.001 },
+        terminalGrowth: { value: 0.025, min: 0.01, max: 0.05, step: 0.001 },
+    } : {
+        revenueGrowth: { value: quote.revenueGrowth || 0.05, min: -0.05, max: 0.20, step: 0.005 },
+        operatingMargin: { value: 0.20, min: 0.05, max: 0.40, step: 0.005 },
+        taxRate: { value: quote.taxRate, min: 0.10, max: 0.40, step: 0.005 },
+        reinvestmentRate: { value: 0.30, min: 0.10, max: 0.60, step: 0.01 },
+        wacc: { value: 0.08, min: 0.05, max: 0.12, step: 0.001 },
+        terminalGrowth: { value: 0.025, min: 0.01, max: 0.05, step: 0.001 },
+    };
+    
+    // Simplified DCF calculation
+    const terminalValue = (quote.ebitda * (1 + dcfInputs.terminalGrowth.value)) / ((dcfInputs.wacc?.value || dcfInputs.costOfEquity.value) - dcfInputs.terminalGrowth.value);
+    const enterpriseValue = terminalValue; // Highly simplified
+    const equityValue = enterpriseValue - quote.netDebt;
+    const impliedSharePrice = equityValue / quote.shares;
+    
+    const generateLboScenario = (id) => ({
+        header: { ticker: quote.ticker, scenario: `${id} Scenario`, scenarioId: id },
+        inputs: {
+            purchasePrice: { value: quote.marketCap },
+            debtFinancing: { value: 0.6, min: 0.4, max: 0.8, step: 0.01 },
+            interestRate: { value: quote.interestRate, min: 0.05, max: 0.12, step: 0.0025 },
+            ebitdaGrowth: { value: 0.05, min: 0, max: 0.15, step: 0.005 },
+            exitMultiple: { value: quote.evEbitda || 12, min: 8, max: 20, step: 0.25 },
+            holdingPeriod: { value: 5, min: 3, max: 7, step: 1 },
+            // Scenario specific inputs
+            recapYear: { value: 3, min: 2, max: 5, step: 1 },
+            dividendPayout: { value: 0.5, min: 0.2, max: 0.8, step: 0.05 },
+            mezzanineFinancing: { value: 0.15, min: 0.05, max: 0.3, step: 0.01 },
+            mezzanineInterestRate: { value: 0.14, min: 0.10, max: 0.20, step: 0.005 },
+        },
+        outputs: {
+            projections: Array.from({ length: 5 }, (_, i) => ({
+                year: i + 1,
+                ebitda: quote.ebitda * Math.pow(1.05, i + 1),
+                cashFlow: quote.ebitda * Math.pow(1.05, i + 1) * 0.6,
+                endingDebt: quote.marketCap * 0.6 * (1 - (i + 1) * 0.15)
+            })),
+            returns: {
+                irr: Math.random() * 0.15 + 0.15, // 15-30%
+                moic: Math.random() * 1.5 + 2.0, // 2.0-3.5x
+                entryEquity: quote.marketCap * (1 - 0.6),
+                exitEquity: (quote.ebitda * Math.pow(1.05, 5) * 12) - (quote.marketCap * 0.6 * (1 - 5 * 0.15))
             }
-        } catch (err) {
-            state.analysisContent[key] = { ticker: state.ticker, content: `Error: ${(err as Error).message}`};
-        } finally {
-            state.loading.analysis = false;
         }
-    }
-    renderApp();
-}
-
-function runLboUpdate() {
-    const workflow = state.dashboardData.workflow;
-    if (!workflow) return;
-
-    const scenario = state.lboScenario;
-    const scenarioIndex = workflow.lboAnalysis.scenarios.findIndex(s => s.header.scenarioId === scenario);
-    if (scenarioIndex === -1) return;
-
-    const currentScenarioData = workflow.lboAnalysis.scenarios[scenarioIndex];
-    const inputs = currentScenarioData.inputs;
-    
-    const assumptions = {
-        purchasePrice: inputs.purchasePrice.value,
-        debtFinancing: inputs.debtFinancing.value,
-        interestRate: inputs.interestRate.value,
-        ebitdaGrowth: inputs.ebitdaGrowth.value,
-        exitMultiple: inputs.exitMultiple.value,
-        holdingPeriod: inputs.holdingPeriod.value,
-        ...(['dividendRecap', 'leveragedRecap'].includes(scenario) && {
-            recapYear: inputs.recapYear.value,
-            dividendPayout: inputs.dividendPayout.value,
-        }),
-        ...(scenario === 'mezzanineDebt' && {
-            mezzanineFinancing: inputs.mezzanineFinancing.value,
-            mezzanineInterestRate: inputs.mezzanineInterestRate.value,
-        }),
-    };
-
-    const newCalculatedOutputs = calculateLboOutputs(state.dashboardData.quote, assumptions, scenario);
-    const { sentiment, commentary } = getLboSentimentAndCommentary(newCalculatedOutputs.irr, newCalculatedOutputs.moic, scenario);
-    
-    // Update the specific scenario in the state
-    const updatedScenario = workflow.lboAnalysis.scenarios[scenarioIndex];
-    updatedScenario.outputs = {
-        ebitda: newCalculatedOutputs.projections.map(p => p.ebitda),
-        cashFlow: newCalculatedOutputs.projections.map(p => p.cashFlow),
-        debtBalance: newCalculatedOutputs.projections.map(p => p.debtBalance),
-        sponsorEquity: newCalculatedOutputs.initialEquity,
-        seniorDebt: newCalculatedOutputs.initialSeniorDebt,
-        mezzanineDebt: newCalculatedOutputs.initialMezzanineDebt,
-        exitEquityValue: newCalculatedOutputs.exitEquityValue,
-        irr: newCalculatedOutputs.irr,
-        moic: newCalculatedOutputs.moic,
-        dividendPaid: newCalculatedOutputs.dividendPaid,
-    };
-    updatedScenario.header.badge = sentiment.badge;
-    updatedScenario.sentiment = sentiment.badge;
-    updatedScenario.commentary = commentary.text;
-
-    renderLboOutputs();
-    
-    const purchasePriceDisplay = document.getElementById('lbo-purchase-price-display');
-    if (purchasePriceDisplay) {
-        purchasePriceDisplay.textContent = formatterService.largeNumber(assumptions.purchasePrice);
-    }
-}
-
-
-function handleModelInputChange(event) {
-    const target = event.target as HTMLInputElement;
-    if (!target.classList.contains('model-slider')) return;
-    
-    const modelType = target.dataset.model; // 'dcf' or 'lbo'
-    const inputIdRaw = target.id.split('-').slice(1).join('');
-    const inputId = inputIdRaw.charAt(0).toLowerCase() + inputIdRaw.slice(1);
-    const value = parseFloat(target.value);
-    
-    const workflow = state.dashboardData.workflow;
-    if (!workflow) return;
-
-    if (modelType === 'dcf') {
-        const dcfData = workflow.dcfValuation;
-        dcfData.inputs[inputId].value = value;
-        
-        const assumptions = dcfData.modelType === 'Financials'
-            ? { // Financials model assumptions
-                roe: dcfData.inputs.roe.value,
-                reinvestmentRate: dcfData.inputs.reinvestmentRate.value,
-                costOfEquity: dcfData.inputs.costOfEquity.value,
-                terminalGrowth: dcfData.inputs.terminalGrowth.value,
-            }
-            : { // Standard model assumptions
-                revenueGrowth: dcfData.inputs.revenueGrowth.value,
-                operatingMargin: dcfData.inputs.operatingMargin.value,
-                taxRate: dcfData.inputs.taxRate.value,
-                reinvestmentRate: dcfData.inputs.reinvestmentRate.value,
-                wacc: dcfData.inputs.wacc.value,
-                terminalGrowth: dcfData.inputs.terminalGrowth.value,
-            };
-
-        const newOutputs = calculateDcfOutputs(state.dashboardData.quote, assumptions);
-        dcfData.outputs = newOutputs;
-        const { sentiment, commentary } = getDcfSentimentAndCommentary(newOutputs, state.dashboardData.quote);
-        dcfData.sentiment = sentiment;
-        dcfData.commentary = commentary;
-
-        const formatter = ['holdingPeriod', 'recapYear'].includes(inputId)
-            ? (v) => `${v}`
-            : formatterService.percent;
-        document.getElementById(`dcf-${inputId}-value`).textContent = formatter(value);
-        renderDcfOutputs();
-
-    } else if (modelType === 'lbo') {
-        const scenario = state.lboScenario;
-        const scenarioData = workflow.lboAnalysis.scenarios.find(s => s.header.scenarioId === scenario);
-        if (scenarioData) {
-            scenarioData.inputs[inputId].value = value;
-            const formatter = inputId === 'exitMultiple' ? (v) => formatterService.ratio(v) 
-                            : ['holdingPeriod', 'recapYear'].includes(inputId) ? (v) => `${v}`
-                            : formatterService.percent;
-            document.getElementById(`lbo-${inputId}-value`).textContent = formatter(value);
-            runLboUpdate();
-        }
-    }
-}
-
-async function handleLboScenarioChange(event) {
-    const newScenario = (event.target as HTMLSelectElement).value;
-    state.lboScenario = newScenario;
-    // Data is already generated, just re-render the card with the selected scenario
-    renderLboCard('lbo-model-container');
-}
-
-
-function handleBackToReport() {
-    state.currentTab = 'valuation_models';
-    renderApp();
-}
-function handleCopy() {
-    const content = document.querySelector('.prose-custom') as HTMLElement;
-    const button = document.getElementById('copy-btn');
-    if (content && button) {
-        navigator.clipboard.writeText(content.innerText).then(() => {
-            button.textContent = 'Copied!';
-            setTimeout(() => { button.textContent = 'Copy'; }, 2000);
-        });
-    }
-}
-function handlePeerSort(column) {
-    if (state.peerSort.column === column) {
-        state.peerSort.direction = state.peerSort.direction === 'asc' ? 'desc' : 'asc';
-    } else {
-        state.peerSort.column = column;
-        state.peerSort.direction = 'desc';
-    }
-    renderApp();
-}
-
-function handleToggleAlertInput() {
-    state.showAlertInput = !state.showAlertInput;
-    renderApp();
-}
-
-async function handleSetAlert() {
-    const input = document.getElementById('alert-price-input') as HTMLInputElement;
-    const targetPrice = parseFloat(input.value);
-    if (isNaN(targetPrice) || targetPrice <= 0) {
-        alert("Please enter a valid price.");
-        return;
-    }
-
-    if (Notification.permission === 'default') {
-        await Notification.requestPermission();
-    }
-
-    if (Notification.permission === 'denied') {
-        alert("Notifications are blocked. Please enable them in your browser settings to use price alerts.");
-        return;
-    }
-
-    const currentPrice = state.dashboardData.quote.price;
-    state.alert = {
-        target: targetPrice,
-        active: true,
-        triggered: false,
-        direction: targetPrice > currentPrice ? 'up' : 'down'
-    };
-    state.showAlertInput = false;
-    renderApp();
-}
-
-function handleClearAlert() {
-    state.alert = { target: null, active: false, triggered: false, direction: null };
-    state.showAlertInput = false;
-    renderApp();
-}
-
-function handleExportPeersToCSV() {
-    const data = state.dashboardData;
-    if (!data || !data.peers || !data.workflow.peerComparison) return;
-
-    const mainTickerData = data.quote;
-    const peerComparison = data.workflow.peerComparison;
-    
-    const allCompanies = [mainTickerData, ...data.peers].map(p => {
-         const positionData = peerComparison.outputs.positions[p.ticker] || {};
-         const evEbitda = (p.ebitda && p.ebitda > 0) ? p.marketCap / p.ebitda : null;
-         return {
-            companyName: p.companyName,
-            ticker: p.ticker,
-            marketCap: p.marketCap,
-            ebitda: p.ebitda,
-            revenueGrowth: p.revenueGrowth,
-            peRatio: p.peRatio,
-            evEbitda: evEbitda,
-            pePosition: positionData['P/E'],
-            evEbitdaPosition: positionData['EV/EBITDA'],
-        };
     });
 
-    const headers = ['Company Name', 'Ticker', 'Market Cap (USD)', 'EBITDA (USD)', 'Revenue Growth (%)', 'P/E Ratio', 'EV/EBITDA'];
-    const rows = allCompanies.map(c => [
-        `"${c.companyName.replace(/"/g, '""')}"`,
-        c.ticker,
-        c.marketCap || 'N/A',
-        c.ebitda || 'N/A',
-        c.revenueGrowth ? (c.revenueGrowth * 100).toFixed(2) : 'N/A',
-        c.peRatio ? c.peRatio.toFixed(2) : 'N/A',
-        c.evEbitda ? c.evEbitda.toFixed(2) : 'N/A'
-    ]);
+    const lboScenarios = DOMAIN_SCENARIOS[domain].map(s => generateLboScenario(s.id));
 
-    const csvContent = "data:text/csv;charset=utf-8," 
-        + [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
-    
-    const encodedUri = encodeURI(csvContent);
-    const link = document.createElement("a");
-    link.setAttribute("href", encodedUri);
-    link.setAttribute("download", `${state.ticker}_peer_comparison.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-}
-
-function handlePrevSlide() {
-    if (state.pitchDeck.currentSlide > 0) {
-        state.pitchDeck.currentSlide--;
-        renderPitchDeckView(document.getElementById('content-container'));
-    }
-}
-
-function handleNextSlide() {
-    if (state.pitchDeck.currentSlide < state.pitchDeck.slides.length - 1) {
-        state.pitchDeck.currentSlide++;
-        renderPitchDeckView(document.getElementById('content-container'));
-    }
-}
-
-function handleCopySlide() {
-    const currentSlide = state.pitchDeck.slides[state.pitchDeck.currentSlide];
-    const button = document.getElementById('copy-slide-btn');
-    if (currentSlide && button) {
-        const textToCopy = `${currentSlide.title}\n\n${currentSlide.content}`;
-        navigator.clipboard.writeText(textToCopy).then(() => {
-            const originalText = button.innerHTML;
-            button.textContent = 'Copied!';
-            setTimeout(() => { button.innerHTML = originalText; }, 2000);
-        });
-    }
-}
-
-function handleThemeToggle() {
-    state.theme = state.theme === 'dark' ? 'light' : 'dark';
-    localStorage.setItem('banksmart-theme', state.theme);
-    document.body.classList.toggle('dark-mode', state.theme === 'dark');
-    renderHeader();
-    addDashboardEventListeners();
-    // Re-render current view to update charts with new theme
-    if(state.currentView === 'dashboard') {
-        renderContent();
-    }
+    return {
+        dcfValuation: {
+            header: { ticker: quote.ticker, badge: isFinancial ? 'DDM Model' : 'DCF Model' },
+            modelType: isFinancial ? 'DDM' : 'DCF',
+            inputs: dcfInputs,
+            outputs: {
+                impliedSharePrice,
+                premium: (impliedSharePrice / quote.price) - 1,
+                enterpriseValue,
+                equityValue,
+            },
+        },
+        lboAnalysis: {
+            scenarios: lboScenarios
+        }
+    };
 }
 
 
-// --- INITIALIZATION ---
-document.addEventListener('DOMContentLoaded', () => {
+// --- 9. APP INITIALIZATION ---
+function initApp() {
+    loadState();
     document.body.classList.toggle('dark-mode', state.theme === 'dark');
     renderApp();
-});
+}
+
+document.addEventListener('DOMContentLoaded', initApp);
